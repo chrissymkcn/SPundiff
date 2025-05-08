@@ -1,0 +1,5 @@
+setup.py
+SPUndiff.egg-info/PKG-INFO
+SPUndiff.egg-info/SOURCES.txt
+SPUndiff.egg-info/dependency_links.txt
+SPUndiff.egg-info/top_level.txt

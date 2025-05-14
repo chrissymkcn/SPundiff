@@ -19,6 +19,20 @@ import time
 # from joblib import Parallel, delayed
 from scipy.sparse import isspmatrix
 
+class DynamicLossBalancer:
+    def __init__(self, num_losses=2):
+        # Initialize learnable log variances
+        self.log_vars = torch.nn.Parameter(torch.zeros(num_losses))
+        
+    def __call__(self, losses):
+        # Convert to precision (inverse variance)
+        precision = torch.exp(-self.log_vars)
+        
+        # Weighted loss + regularization
+        weighted_losses = precision * losses + self.log_vars
+        return torch.sum(weighted_losses)
+
+
 class undiff():
     DEFAULT_OT_PARAMS = {
         # OT parameters
@@ -235,9 +249,10 @@ class undiff():
         print('loss_d', loss_d)
         loss = sum(loss_d.values())
         
-        # Store the error value
-        self.objective_values.append(loss)
-        return loss
+        # # Store the error value
+        # self.objective_values.append(loss)
+
+        return torch.stack(list(loss_d.values()))
 
     def impute_qt_vectorized(self, n_steps=10, max_qt=0.3):
         """
@@ -350,11 +365,11 @@ class undiff():
         elif optim_name == 'lbfgs':
             optimizer = optim.LBFGS(
                 params=[
-                    {'params': self.cost_weight_s, 'lr': lr},
-                    {'params': self.cost_weight_t, 'lr': lr},
                     {'params': self.invalid_qts, 'lr': lr},
                     {'params': self.regs, 'lr': lr},
-                    {'params': self.global_reg, 'lr': lr}
+                    {'params': self.global_reg, 'lr': lr},
+                    {'params': self.cost_weight_s, 'lr': lr},
+                    {'params': self.cost_weight_t, 'lr': lr},
                 ],
             )
         
@@ -364,15 +379,18 @@ class undiff():
             optimizer.zero_grad(set_to_none=True)
             loss = self.objective(
                 {
-                    'cost_weight_s': self.cost_weight_s,
-                    'cost_weight_t': self.cost_weight_t,
                     'invalid_qts': self.invalid_qts,
                     'regs': self.regs,
                     'global_reg': self.global_reg,
+                    'cost_weight_s': self.cost_weight_s,
+                    'cost_weight_t': self.cost_weight_t,
                 }
             )
+            balancer = DynamicLossBalancer()
+            dw_loss = balancer(loss)
+            print(f"Balanced Loss: {dw_loss.item()}")
             time_start = time.time()
-            loss.backward()
+            dw_loss.backward()
             print(f"Backward pass time cost: {time.time() - time_start}s")
             assert self.cost_weight_s.grad is not None, "Gradients not reaching cost_weight_s!"
             assert self.cost_weight_t.grad is not None, "Gradients not reaching cost_weight_t!"
@@ -386,7 +404,12 @@ class undiff():
                 self.invalid_qts.grad.norm(), 
                 self.global_reg.grad.norm())
             if epoch > 0:
-                grad_norm = torch.cat([p.grad.flatten() for p in optimizer.param_groups[0]['params']]).norm()
+                grad_norm = torch.cat([
+                                    p.grad.flatten() 
+                                    for group in optimizer.param_groups 
+                                    for p in group['params']
+                                    if p.grad is not None  # Handle None gradients
+                                ]).norm()
                 if grad_norm < self.params['train_tol']:
                     break
             start = time.time()

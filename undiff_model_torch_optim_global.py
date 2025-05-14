@@ -25,19 +25,19 @@ class undiff_global(undiff):
         return x_qvals
 
 
-    def gene_specific_adaptation(self, out_dist, in_dist, out_sum, in_sum):
-        # Get gene-specific distributions
-        global_ot = self.global_ot  # [n_spots, n_spots]    
-        ## assume out_dist and in_dist are already normalized to sum to 1
-        # Compute scaling factors
-        row_scale = out_dist / global_ot.sum(1)
-        col_scale = in_dist / global_ot.sum(0)
+    # def gene_specific_adaptation(self, out_dist, in_dist, out_sum, in_sum):
+    #     # Get gene-specific distributions
+    #     global_ot = self.global_ot  # [n_spots, n_spots]    
+    #     ## assume out_dist and in_dist are already normalized to sum to 1
+    #     # Compute scaling factors
+    #     row_scale = out_dist / global_ot.sum(1)
+    #     col_scale = in_dist / global_ot.sum(0)
         
-        # Compute adapted transport (no need for full matrix)
-        to_target = (global_ot * row_scale.unsqueeze(1) * col_scale.unsqueeze(0)).sum(0)
-        to_target = to_target / to_target.sum()
-        to_return = to_target * out_sum + in_dist * in_sum
-        return to_return  # [n_spots, 1]
+    #     # Compute adapted transport (no need for full matrix)
+    #     to_target = (global_ot * row_scale.unsqueeze(1) * col_scale.unsqueeze(0)).sum(0)
+    #     to_target = to_target / to_target.sum()
+    #     to_return = to_target * out_sum + in_dist * in_sum
+    #     return to_return  # [n_spots, 1]
 
     def gene_specific_adaptation_reg(self, gene_expr_out, gene_expr_in, out_sum, in_sum, reg):
         """

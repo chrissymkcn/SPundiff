@@ -1,3 +1,11 @@
+# This is a project to correct for mRNA diffusion in spatial transcriptomic data. The background is that mRNA molecules diffuse during 
+# sequencing (according to some physical law, assumed to be physical diffusion with potential obstruction by cellular environment) 
+# and I am essentially trying to impute the undiffused state from the final concentration field. 
+# The main idea is to use the spatial coordinates of the spots and the expression values of the genes to learn a mapping from the observed.
+# OT framework is used to model/simulate the reverse diffusion process. To allow adaptation to different genes, I compute a global ot plan first
+# and then adapt it to each gene using a gene-specific diffusion coefficient.
+
+
 import squidpy as sq
 from scipy.cluster.hierarchy import linkage, leaves_list
 from concurrent.futures import ThreadPoolExecutor
@@ -826,8 +834,7 @@ class undiff():
         params = self.params
         reg = global_reg
         # use total expression counts to compute the global ot
-        ttl_cnts = torch.tensor(self.raw_count.toarray().sum(axis=1), requires_grad=False)  # all genes
-        # ttl_cnts = self.sub_count.sum(axis=1).detach().clone()  # selected genes
+        ttl_cnts = self.sub_count.sum(dim=1)  # selected genes
         eps = 1e-10
         total_source = ttl_cnts * (self.in_tiss_mask == 0).float()
         total_source = (total_source + eps) / total_source.sum()
@@ -898,7 +905,7 @@ class undiff():
         
         all_hvgs = self.adata.var_names[self.adata.var['highly_variable']].values
         union_genes = np.concatenate([union_genes, all_hvgs])
-        union_genes = union_genes.tolist()
+        union_genes = np.unique(union_genes).tolist()
         
         # Remove mitochondrial and DEPRECATED genes
         to_remove = ['MT-', 'mt-', 'DEPRECATED','Rik']
@@ -1030,3 +1037,108 @@ class undiff():
         penalty = torch.mean(torch.abs(neighbor_diffs))  # L1 penalty
         
         return penalty_weight * penalty
+    
+    def get_undiff_adata(self, genes=None):
+        tissmask = self.adata.obs['in_tissue'].astype(bool)
+        genes = self.gene_selected + [g for g in genes if g not in self.gene_selected] if genes is not None else self.gene_selected
+        adata_ot = self.adata[tissmask, genes].copy()
+        adata_ot.X = self.res_count.detach().numpy()
+        return adata_ot
+    
+    def round_counts_to_integers(self, preserve_sum=True, return_copy=False):
+        """
+        Round corrected expression counts to integers.
+        
+        Parameters
+        ----------
+        preserve_sum : bool, default=True
+            If True, preserve the column-wise sums during rounding
+        return_copy : bool, default=False
+            If True, return a copy of the rounded counts without modifying self.res_count
+            
+        Returns
+        -------
+        rounded_counts : torch.Tensor
+            Rounded count matrix (returned only if return_copy=True)
+        """
+        if self.res_count is None:
+            raise ValueError("No corrected counts available. Run optimization first.")
+            
+        # Work with a copy to avoid modifying the original
+        rounded_counts = self.res_count.clone()
+        
+        if preserve_sum:
+            # Approach 1: Preserve column sums using largest remainder method
+            # Get original column sums
+            original_sums = rounded_counts.sum(dim=0)
+            
+            # Simple rounding
+            simple_rounded = torch.round(rounded_counts)
+            
+            # Calculate column sums after simple rounding
+            rounded_sums = simple_rounded.sum(dim=0)
+            
+            # Calculate deficit or excess for each column
+            count_diff = original_sums - rounded_sums
+            
+            for j in range(rounded_counts.shape[1]):
+                if count_diff[j] == 0:
+                    continue
+                    
+                # Get the fractional parts
+                frac_parts = rounded_counts[:, j] - simple_rounded[:, j]
+                
+                # We need to adjust based on deficit or excess
+                adjustment = int(count_diff[j].item())
+                
+                if adjustment > 0:  # Need to round up more values
+                    # Find cells with highest fractional parts that were rounded down
+                    rounded_down = (frac_parts > 0) & (frac_parts < 0.5)
+                    candidates = torch.where(rounded_down)[0]
+                    
+                    # If not enough candidates, also consider those that were rounded up
+                    if len(candidates) < adjustment:
+                        rounded_up = frac_parts >= 0.5
+                        more_candidates = torch.where(rounded_up)[0]
+                        candidates = torch.cat([candidates, more_candidates])
+                    
+                    # Sort by fractional part (descending)
+                    if len(candidates) > 0:
+                        sorted_indices = candidates[torch.argsort(-frac_parts[candidates])]
+                        # Adjust by rounding up the top candidates
+                        for i in range(min(adjustment, len(sorted_indices))):
+                            simple_rounded[sorted_indices[i], j] += 1
+                            
+                elif adjustment < 0:  # Need to round down more values
+                    # Find cells with lowest fractional parts that were rounded up
+                    rounded_up = frac_parts >= 0.5
+                    candidates = torch.where(rounded_up)[0]
+                    
+                    # If not enough candidates, also consider those that were rounded down
+                    if len(candidates) < abs(adjustment):
+                        rounded_down = frac_parts < 0.5
+                        more_candidates = torch.where(rounded_down)[0]
+                        candidates = torch.cat([candidates, more_candidates])
+                    
+                    # Sort by fractional part (ascending)
+                    if len(candidates) > 0:
+                        sorted_indices = candidates[torch.argsort(frac_parts[candidates])]
+                        # Adjust by rounding down the bottom candidates
+                        for i in range(min(abs(adjustment), len(sorted_indices))):
+                            simple_rounded[sorted_indices[i], j] -= 1
+            
+            rounded_counts = simple_rounded
+        else:
+            # Simple rounding without preserving sums
+            rounded_counts = torch.round(rounded_counts)
+        
+        # Ensure no negative values
+        rounded_counts = torch.clamp(rounded_counts, min=0)
+        
+        # Either return the copy or modify in-place
+        if return_copy:
+            return rounded_counts
+        else:
+            self.res_count = rounded_counts
+            print(f"Rounded counts stored in res_count. Original range: [{self.res_count.min():.2f}, {self.res_count.max():.2f}]")
+            return None

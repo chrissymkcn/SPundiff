@@ -1,3 +1,4 @@
+README.md
 setup.py
 SPUndiff.egg-info/PKG-INFO
 SPUndiff.egg-info/SOURCES.txt

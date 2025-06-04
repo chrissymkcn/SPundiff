@@ -1,12 +1,10 @@
 from undiff_model_torch_optim import undiff
-import numpy as np
 import torch
-import torch.optim as optim
-import time
+import pyro.distributions as dist
 
 class undiff_global(undiff):
-    def __init__(self, adata, n_jobs=1, metric='euclidean', img_key='hires', optimizer='adam', optim_params=None):
-        super().__init__(adata, n_jobs, metric, img_key, optimizer, optim_params)
+    def __init__(self, adata, n_jobs=1, metric='euclidean',optimizer='adam', optim_params=None):
+        super().__init__(adata, n_jobs, metric, optimizer, optim_params)
 
     def smooth_quantile_batch(self, x, q):
         """Differentiable approximation of quantile"""
@@ -24,22 +22,7 @@ class undiff_global(undiff):
         x_qvals = (1 - weight) * sorted_x[lower, torch.arange(sorted_x.size(1))] + weight * sorted_x[upper, torch.arange(sorted_x.size(1))] 
         return x_qvals
 
-
-    # def gene_specific_adaptation(self, out_dist, in_dist, out_sum, in_sum):
-    #     # Get gene-specific distributions
-    #     global_ot = self.global_ot  # [n_spots, n_spots]    
-    #     ## assume out_dist and in_dist are already normalized to sum to 1
-    #     # Compute scaling factors
-    #     row_scale = out_dist / global_ot.sum(1)
-    #     col_scale = in_dist / global_ot.sum(0)
-        
-    #     # Compute adapted transport (no need for full matrix)
-    #     to_target = (global_ot * row_scale.unsqueeze(1) * col_scale.unsqueeze(0)).sum(0)
-    #     to_target = to_target / to_target.sum()
-    #     to_return = to_target * out_sum + in_dist * in_sum
-    #     return to_return  # [n_spots, 1]
-
-    def gene_specific_adaptation_reg(self, gene_expr_out, gene_expr_in, out_sum, in_sum, reg):
+    def gene_specific_adaptation(self, gene_expr_out, gene_expr_in, out_sum, in_sum, reg):
         """
         Improved gene-specific adaptation using global OT plan as structural prior
         
@@ -52,7 +35,6 @@ class undiff_global(undiff):
             transported_in: [n_spots] - adapted transport for this gene
         """
         global_ot = self.global_ot  # [n_spots, n_spots]
-        eps = 1e-10
         # Normalize gene-specific distributions
         p = gene_expr_out / (gene_expr_out.sum())  # Source
         q = gene_expr_in / (gene_expr_in.sum())    # Target
@@ -91,11 +73,11 @@ class undiff_global(undiff):
             g_out, g_in = out_tiss_filt[:, i], in_tiss_filt[:, i]
             g_outsum, g_insum = out_tiss_sum[i], in_tiss_sum[i]
             # transported_in = self.gene_specific_adaptation(g_out, g_in, g_outsum, g_insum)
-            transported_in = self.gene_specific_adaptation_reg(g_out, g_in, g_outsum, g_insum, regs[i])
+            transported_in = self.gene_specific_adaptation(g_out, g_in, g_outsum, g_insum, regs[i])
             res.append(transported_in)
         self.res_count = torch.stack(res, dim=1)
  
-    def run_one_round_ot(self, params):
+    def run_ot(self, params):
         cost_weight_s = params['cost_weight_s']
         cost_weight_t = params['cost_weight_t']
         invalid_qts = params['invalid_qts']
@@ -107,19 +89,20 @@ class undiff_global(undiff):
         self.cost_matrix_calculation(cost_weight_s, cost_weight_t) # for computing scaled cost matrix
         self.compute_shared_OT(global_reg) # for updating warmstart
         # Use checkpoint for memory-efficient OT computation
-        self.compute_ot_batch(invalid_qts, regs)
+        self.compute_res_count({
+            'regs': regs,
+            'invalid_qts': invalid_qts
+        })
         
-    def run_one_round(self, first_n_genes=None, add_genes=[], optim_params=None):
+    def run_one_round(self, n_genes=None, add_genes=[], optim_params=None):
         self.params.update(optim_params) if optim_params is not None else None
-        self.prep_genes_params(add_genes=add_genes, first_n_genes=first_n_genes)
+        self.prep_genes_params(add_genes=add_genes, first_n_genes=n_genes)
         self.set_states(qts_prior=0.3)
-        # test case 
-        resdict = self.run_one_round_ot({
+        self.run_ot({
             'cost_weight_s': self.cost_weight_s,
             'cost_weight_t': self.cost_weight_t,
             'invalid_qts': self.invalid_qts,
             'regs': self.regs,
             'global_reg': self.global_reg
         })
-        return resdict
         

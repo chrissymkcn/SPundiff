@@ -20,6 +20,7 @@ import ot  # ot
 import pandas as pd
 import scanpy as sc
 import time
+from sklearn.metrics.pairwise import cosine_similarity
 # import torch.utils.checkpoint as checkpoint
 # from sklearn.metrics import silhouette_score
 # from scipy.optimize import minimize
@@ -67,7 +68,7 @@ class undiff():
     }
     
     def __init__(self, adata, n_jobs=1, metric='euclidean', 
-                img_key='hires', optimizer='adam', optim_params=None):
+               optimizer='adam', optim_params=None):
         self.adata = adata.copy()
         self.var_names = adata.var_names
         self.sub_count = None
@@ -78,7 +79,7 @@ class undiff():
         self.spatial_dist = adata.obsp['spatial_distances']
         # self.coords = self.spatial_to_grid()
         # self.coords = self.coords - self.coords.min(axis=0)
-        self.img_key = img_key
+        self.img_key = 'hires'
         self.lib_id = list(self.adata.uns['spatial'].keys())[0]
         self.y1_max, self.y2_max = self.adata.uns['spatial'][self.lib_id]['images'][self.img_key].shape[:2]
         self.coords = self.scale_spatial()
@@ -107,20 +108,123 @@ class undiff():
         torch.backends.cudnn.benchmark = True  # Enable cudnn auto-tuner
         torch.backends.cudnn.enabled = True
 
+    def interpolate_grid(self):
+        coords = self.adata.obsm['spatial'].copy()
 
+        # Calculate optimal grid size
+        n_bins = int(np.ceil(np.sqrt(self.adata.n_obs)))
+        while True:
+            x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+            y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+            
+            bin_width = (x_max - x_min) / n_bins
+            bin_height = (y_max - y_min) / n_bins
+            
+            # Calculate grid indices
+            grid_x = np.floor((coords[:, 0] - x_min) / bin_width)
+            grid_y = np.floor((coords[:, 1] - y_min) / bin_height)
+            
+            # Check for uniqueness
+            if len(set(zip(grid_x, grid_y))) == self.adata.n_obs:
+                break
+            n_bins += 1
+        
+        # Calculate normalized coordinates
+        min_x_diff = np.diff(np.unique(grid_x)).min()
+        min_y_diff = np.diff(np.unique(grid_y)).min()
+        
+        # Handle case where all x or y coordinates are the same
+        min_x_diff = min_x_diff if not np.isnan(min_x_diff) else 1
+        min_y_diff = min_y_diff if not np.isnan(min_y_diff) else 1
+        
+        x_u = grid_x / min_x_diff
+        y_u = grid_y / min_y_diff
+        
+        # Ensure integer coordinates after normalization
+        x_u = np.round(x_u - x_u.min()).astype(int)
+        y_u = np.round(y_u - y_u.min()).astype(int)
+        
+        # Final uniqueness check
+        assert len(set(zip(x_u, y_u))) == self.adata.n_obs, "Duplicate coordinates after normalization"
+        
+        return np.column_stack([grid_x, grid_y])
 
-    def spatial_to_grid(self, orig_basis='spatial'):
-        df = self.adata.obsm[orig_basis]
-        df = pd.DataFrame(df, columns=['x','y'])
-        x = df['x'].value_counts().index[0]
-        y = df['y'].value_counts().index[1]
-        re_x, re_y = df[df['y']==y]['x'].diff().abs().min()//2, df[df['x']==x]['y'].diff().abs().min()
-        spatial = self.adata.obsm['spatial'].copy()
-        spatial[:, 0] = (spatial[:, 0]/re_x).round()
-        spatial[:, 1] = (spatial[:, 1]/re_y).round()
-        return spatial
-    
-    def twod_grid(self, values):
+    def calc_diff(self, df):
+        diffs_x = []
+        diffs_y = []
+        for i in df['y'].unique():
+            diffs = df[df['y'] == i]['x'].sort_values().diff().unique()
+            diffs_x += [x for x in diffs if not np.isnan(x) and x not in diffs_x and x > 0]
+        for i in df['x'].unique():
+            diffs = df[df['x'] == i]['y'].sort_values().diff().unique()
+            diffs_y += [y for y in diffs if not np.isnan(y) and y not in diffs_y and y > 0]
+        print(f"diffs_x: {diffs_x}")
+        print(f"diffs_y: {diffs_y}")
+        return diffs_x, diffs_y    
+
+    def calc_grid(self, df, cols):
+        diffs_x, diffs_y = self.calc_diff(df)
+        for col in cols:
+            other_col = 'y' if col == 'x' else 'x'
+            diffs = diffs_y if col == 'x' else diffs_x
+            for i in df[col].sort_values().unique():
+                coords = df[df[col] == i].sort_values(by=other_col)
+                for j in range(coords.shape[0]):
+                    difflast = coords.iloc[j][other_col] - coords.iloc[j-1][other_col]
+                    if difflast > np.min(diffs):
+                        coords.iloc[j][other_col] = coords.iloc[j-1][other_col] + np.min(diffs)
+                df.loc[coords.index, other_col] = coords[other_col]
+        return df
+
+    # write above logic in a function, as concise as possible, no plotting
+    def spatial_to_grid(self):
+        df = pd.DataFrame(self.interpolate_grid(), columns=['x', 'y'])
+        xy_order = self.calc_grid(df.copy(), ['x', 'y'])
+        yx_order = self.calc_grid(df.copy(), ['y', 'x'])
+        # print(f"xy_order: {xy_order.iloc[:10,:]}, yx_order: {yx_order.iloc[:10,:]}")
+        self.adata.obsm['grid_spatial_xy'] = np.column_stack([xy_order['x'], xy_order['y']])
+        self.adata.obsm['grid_spatial_yx'] = np.column_stack([yx_order['x'], yx_order['y']])
+        for key_added in ['grid_spatial_xy', 'grid_spatial_yx', 'spatial']:
+            sq.gr.spatial_neighbors(self.adata, spatial_key=key_added, n_neighs=6, key_added=f'{key_added}')
+        # calculate similarity between the orinigal adjacency matrix (from 'spatial') and adj matrices from the two grid_spatial embeddings
+        spatial_adj = self.adata.obsp['spatial_distances']
+        xy_adj = self.adata.obsp['grid_spatial_xy_distances']
+        yx_adj = self.adata.obsp['grid_spatial_yx_distances']
+        xy_diff = cosine_similarity(spatial_adj, xy_adj).mean()
+        yx_diff = cosine_similarity(spatial_adj, yx_adj).mean()
+        # print(f"xy_diff: {xy_diff}, yx_diff: {yx_diff}")    
+        self.adata.obsm['grid_spatial'] = self.adata.obsm['grid_spatial_xy'].copy() if xy_diff > yx_diff else self.adata.obsm['grid_spatial_yx'].copy()
+        for key in ['grid_spatial_xy', 'grid_spatial_yx']:
+            del self.adata.obsm[key], self.adata.obsp[f'{key}_distances'], self.adata.obsp[f'{key}_connectivities'], self.adata.uns[f'{key}_neighbors']        
+        return self.adata.obsm['grid_spatial'].copy()
+
+    def get_coordinates(self, grid: bool = False):
+        """
+        Get spatial coordinates from the adata object.
+        If grid is True, return the grid coordinates.
+        Otherwise, return the original spatial coordinates.
+        """
+        if grid:
+            if 'grid_spatial' not in self.adata.obsm:    
+                coords = self.spatial_to_grid()
+            else:
+                coords = self.adata.obsm['grid_spatial'].copy()
+            coords = torch.tensor(coords, dtype=torch.float32)
+        else:
+            coords = self.coords if isinstance(self.coords, torch.Tensor) else torch.tensor(self.coords, dtype=torch.float32)
+        coords = torch.round(coords).to(torch.float32)
+        return coords
+
+    def grid_embedding(self, values, grid=False):
+        grid_coords = self.get_coordinates(grid=grid)
+        x_max, y_max = grid_coords[:, 0].max(), grid_coords[:, 1].max()
+        twod_grid = np.zeros((int(y_max) + 1, int(x_max) + 1))
+        for i in range(grid_coords.shape[0]):
+            x, y = int(grid_coords[i, 0]), int(grid_coords[i, 1])
+            twod_grid[y, x] = values[i]
+        return twod_grid
+
+    def orig_coord_embedding(self, values):
         """
         Hyper-optimized square drawing with:
         - No extra columns
@@ -129,7 +233,7 @@ class undiff():
         - Minimal memory usage
         """
         image_shape = (self.y1_max, self.y2_max)
-        coords = self.scale_spatial()
+        coords = self.get_coordinates(grid=False)
         grid_coords = torch.round(coords).long()
         
         # Calculate square parameters
@@ -327,16 +431,17 @@ class undiff():
             )
         self.invalid_qts = self.impute_qt_vectorized(max_qt=qts_prior)  # Shape [N], the quantile cutoff is an estimation such that expression above it is highly likely to be the source
         self.invalid_qts.to(device)
-        self.regs = torch.tensor([3.0] * n_genes, requires_grad=True, dtype=torch.float32, device=device)
+        self.regs = torch.tensor([6.0] * n_genes, requires_grad=True, dtype=torch.float32, device=device)
         self.global_reg = torch.tensor(1.0, requires_grad=True, dtype=torch.float32, device=device)
         self.alpha_prev = None
         self.beta_prev = None
         
     def prep_genes_params(self, add_genes=[], first_n_genes=None):
-        raw_count = self.raw_count.toarray()
+        raw_count = self.raw_count.toarray() if issparse(self.raw_count) else self.raw_count
         self.gene_selected = self.gene_selection()
         first_n_genes = first_n_genes if first_n_genes is not None else len(self.gene_selected)
         self.gene_selected = self.gene_selected[:first_n_genes] + [g for g in add_genes if g not in self.gene_selected]
+        self.gene_selected = np.array(self.gene_selected)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.gene_indices = torch.tensor(
             [self.adata.var_names.get_loc(g) for g in self.gene_selected],
@@ -927,15 +1032,20 @@ class undiff():
         sc.pp.pca(self.adata)
         sc.pp.neighbors(self.adata, n_pcs=30, n_neighbors=30)
 
-    def scale_spatial(self, lib_id=None):
-        """
-        Calculate SSIM-based improvement between original and corrected expression.
-        """
-        lib_id = self.lib_id if lib_id is None else lib_id
-        scaled_spatial = self.adata.obsm['spatial'] * self.adata.uns['spatial'][lib_id]['scalefactors'][f'tissue_{self.img_key}_scalef']
-        scaled_spatial = torch.tensor(scaled_spatial, dtype=torch.float32)
+    def scale_spatial(self, lib_id=None, coords=None):
+        if coords is None:
+            coords = self.adata.obsm['spatial']
+        lib_id = list(self.adata.uns['spatial'].keys())[0] if lib_id is None else lib_id
+        img_key = [k for k in self.adata.uns['spatial'][lib_id]['scalefactors'].keys() if 'hires' in k]
+        if len(img_key) > 0:
+            img_key = img_key[0]
+        else:
+            img_key = [k for k in self.adata.uns['spatial'][lib_id]['scalefactors'].keys() if 'lowres' in k][0]
+        scaled_spatial = coords * self.adata.uns['spatial'][lib_id]['scalefactors'][img_key]
+        scaled_spatial = np.round(scaled_spatial)
+        scaled_spatial = torch.tensor(scaled_spatial, dtype=torch.float32, requires_grad=False)
         return scaled_spatial
-
+    
     def get_image_embedding(self, lib_id=None):
         lib_id = self.lib_id if lib_id is None else lib_id
         img = self.adata.uns['spatial'][lib_id]['images'][self.img_key]
@@ -956,7 +1066,7 @@ class undiff():
         else:
             raise ValueError("Invalid count slot. Choose 'res_count' or 'sub_count'.")
         z_sum = z.sum(dim=1, keepdim=True)  # [n_spots, 1]
-        z_field = self.twod_grid(z_sum)  # [height, width]
+        z_field = self.orig_coord_embedding(z_sum)  # [height, width]
         z_field_normed = (z_field - z_field.min()) / (z_field.max() - z_field.min())
         return z_field_normed
         

@@ -1,2 +1,0 @@
-# spadiff
-# SPundiff

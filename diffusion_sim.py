@@ -1,8 +1,23 @@
-from functools import partial
-from pde import CartesianGrid, ScalarField
 import torch
+from torch.distributions import constraints
+from torch.nn import Parameter
 from torch.nn.functional import pdist
 import torch.nn.functional as F
+
+from functools import partial
+from joblib import Parallel, delayed
+
+import pyro
+import pyro.distributions as dist
+from pyro.contrib.gp.models.model import GPModel
+from pyro.nn.module import PyroParam, pyro_method
+import pyro.ops.stats as stats
+
+from pde import CartesianGrid, ScalarField
+from pde import DiffusionPDE
+import numpy as np
+from pde.tools.numba import jit
+from numba.extending import register_jitable
 
 
 def calculate_domain_parameters(coords: torch.Tensor, divideby: float = 1.0):
@@ -96,7 +111,8 @@ def coords_to_grid(
     for i in range(len(coords)):
         grid[x_idx[i], y_idx[i]] = x[i]
     return grid, grid_coords
-    
+
+
 def fill_grid_gaps(grid: torch.Tensor, min_neighs=3) -> torch.Tensor:
     """
     Fill gaps in the grid by averaging neighboring non-zero x.
@@ -147,9 +163,9 @@ def fill_grid_gaps(grid: torch.Tensor, min_neighs=3) -> torch.Tensor:
             break
             
     # Restore original x
-    grid[original_mask] = previous_grid[original_mask]
-    
+    grid[original_mask] = previous_grid[original_mask]    
     return grid
+
 
 def coords_to_filled_grid(
     grid_size,
@@ -173,14 +189,6 @@ def coords_to_filled_grid(
     filled_grid = fill_grid_gaps(grid)
     
     return filled_grid, grid_coords
-
-
-
-import numpy as np
-
-from pde import DiffusionPDE, ScalarField, UnitGrid
-from pde.tools.numba import jit
-from numba.extending import register_jitable
 
 
 class SpatialDiffusionPDE(DiffusionPDE):
@@ -286,6 +294,7 @@ class SpatialDiffusionPDE(DiffusionPDE):
 
             return post_step_hook_impl, 0  # hook function and initial value
 
+
 class forward_diffusion():
     def __init__(self, grid_sizes, voxel_sizes, padding_sizes,
                 x, y, coords, in_tiss_mask, ttl_cnts,
@@ -389,3 +398,297 @@ class forward_diffusion():
             'out_tissue_mask': out_tissue_mask.detach().numpy() if out_tissue_mask.requires_grad else out_tissue_mask.numpy(),
             'diff_mask': diff_mask.detach().numpy() if diff_mask.requires_grad else diff_mask.numpy()
         }
+
+class SparseGPRegression(GPModel):
+    """
+    Sparse Gaussian Process Regression model.
+
+    In :class:`.GPRegression` model, when the number of input data :math:`X` is large,
+    the covariance matrix :math:`k(X, X)` will require a lot of computational steps to
+    compute its inverse (for log likelihood and for prediction). By introducing an
+    additional inducing-input parameter :math:`X_u`, we can reduce computational cost
+    by approximate :math:`k(X, X)` by a low-rank Nystr\u00f6m approximation :math:`Q`
+    (see reference [1]), where
+
+    .. math:: Q = k(X, X_u) k(X_u,X_u)^{-1} k(X_u, X).
+
+    Given inputs :math:`X`, their noisy observations :math:`y`, and the inducing-input
+    parameters :math:`X_u`, the model takes the form:
+
+    .. math::
+        u & \\sim \\mathcal{GP}(0, k(X_u, X_u)),\\\\
+        f & \\sim q(f \\mid X, X_u) = \\mathbb{E}_{p(u)}q(f\\mid X, X_u, u),\\\\
+        y & \\sim f + \\epsilon,
+
+    where :math:`\\epsilon` is Gaussian noise and the conditional distribution
+    :math:`q(f\\mid X, X_u, u)` is an approximation of
+
+    .. math:: p(f\\mid X, X_u, u) = \\mathcal{N}(m, k(X, X) - Q),
+
+    whose terms :math:`m` and :math:`k(X, X) - Q` is derived from the joint
+    multivariate normal distribution:
+
+    .. math:: [f, u] \\sim \\mathcal{GP}(0, k([X, X_u], [X, X_u])).
+
+    This class implements three approximation methods:
+
+    + Deterministic Training Conditional (DTC):
+
+        .. math:: q(f\\mid X, X_u, u) = \\mathcal{N}(m, 0),
+
+      which in turns will imply
+
+        .. math:: f \\sim \\mathcal{N}(0, Q).
+
+    + Fully Independent Training Conditional (FITC):
+
+        .. math:: q(f\\mid X, X_u, u) = \\mathcal{N}(m, diag(k(X, X) - Q)),
+
+      which in turns will correct the diagonal part of the approximation in DTC:
+
+        .. math:: f \\sim \\mathcal{N}(0, Q + diag(k(X, X) - Q)).
+
+    + Variational Free Energy (VFE), which is similar to DTC but has an additional
+      `trace_term` in the model's log likelihood. This additional term makes "VFE"
+      equivalent to the variational approach in :class:`.VariationalSparseGP`
+      (see reference [2]).
+
+    .. note:: This model has :math:`\\mathcal{O}(NM^2)` complexity for training,
+        :math:`\\mathcal{O}(NM^2)` complexity for testing. Here, :math:`N` is the number
+        of train inputs, :math:`M` is the number of inducing inputs.
+
+    References:
+
+    [1] `A Unifying View of Sparse Approximate Gaussian Process Regression`,
+    Joaquin Qui\u00f1onero-Candela, Carl E. Rasmussen
+
+    [2] `Variational learning of inducing variables in sparse Gaussian processes`,
+    Michalis Titsias
+
+    :param torch.Tensor X: A input data for training. Its first dimension is the number
+        of data points.
+    :param torch.Tensor y: An output data for training. Its last dimension is the
+        number of data points.
+    :param ~pyro.contrib.gp.kernels.kernel.Kernel kernel: A Pyro kernel object, which
+        is the covariance function :math:`k`.
+    :param torch.Tensor Xu: Initial values for inducing points, which are parameters
+        of our model.
+    :param torch.Tensor noise: Variance of Gaussian noise of this model.
+    :param callable mean_function: An optional mean function :math:`m` of this Gaussian
+        process. By default, we use zero mean.
+    :param str approx: One of approximation methods: "DTC", "FITC", and "VFE"
+        (default).
+    :param float jitter: A small positive term which is added into the diagonal part of
+        a covariance matrix to help stablize its Cholesky decomposition.
+    :param str name: Name of this model.
+    """
+
+    def __init__(
+        self, X, y, kernel, 
+        coords, in_tiss_mask, ttl_cnts,
+        noise=None, mean_function=None, approx=None, jitter=1e-6
+    ):
+        assert isinstance(
+            X, torch.Tensor
+        ), "X needs to be a torch Tensor instead of a {}".format(type(X))
+        if y is not None:
+            assert isinstance(
+                y, torch.Tensor
+            ), "y needs to be a torch Tensor instead of a {}".format(type(y))
+            
+        self.n_genes, self.n_spots = X.shape
+        n_inducing = int(torch.sqrt(torch.tensor(self.n_genes)))  # number of inducing points
+        mean_function = partial(self.mean_function, coords=coords, ref_count=y,
+            in_tiss_mask=in_tiss_mask, ttl_cnts=ttl_cnts) if mean_function is None else None
+        super().__init__(X, y, kernel=kernel, mean_function=mean_function, jitter=jitter)
+        
+        self.X = pyro.nn.PyroSample(dist.Normal(X, 0.1).to_event())   
+        self.autoguide("X", dist.Normal)
+        
+        Xu = stats.resample(Parameter(X), n_inducing)
+        self.Xu = Parameter(Xu) if not isinstance(Xu, Parameter) else Xu
+
+        noise = self.X.new_tensor(1.0) if noise is None else noise
+        self.noise = PyroParam(noise, constraints.positive)
+
+        if approx is None:
+            self.approx = "VFE"
+        elif approx in ["DTC", "FITC", "VFE"]:
+            self.approx = approx
+        else:
+            raise ValueError(
+                "The sparse approximation method should be one of "
+                "'DTC', 'FITC', 'VFE'."
+            )
+
+    @staticmethod
+    def mean_function(X, coords, ref_count, in_tiss_mask, ttl_cnts):
+        domain_sizes, grid_sizes, voxel_sizes, diffusion_const, padding_sizes = calculate_domain_parameters(coords, divideby=1)
+
+        def process(i):
+            x = X[i, :]
+            y = ref_count[:, i]
+            model = forward_diffusion(
+                grid_sizes=grid_sizes, voxel_sizes=voxel_sizes, padding_sizes=padding_sizes,
+                x=x, y=y, coords=coords, in_tiss_mask=in_tiss_mask, ttl_cnts=ttl_cnts,
+                diffusivity=0.2, noise=0.01,
+            )
+            return torch.tensor(model.run(), dtype=torch.float32)
+
+        res = Parallel(n_jobs=-1)(delayed(process)(i) for i in range(X.shape[0]))
+        return torch.stack(res, dim=0).T
+
+    @pyro_method
+    def model(self):
+        self.set_mode("model")
+
+        # W = (inv(Luu) @ Kuf).T
+        # Qff = Kfu @ inv(Kuu) @ Kuf = W @ W.T
+        # Fomulas for each approximation method are
+        # DTC:  y_cov = Qff + noise,                   trace_term = 0
+        # FITC: y_cov = Qff + diag(Kff - Qff) + noise, trace_term = 0
+        # VFE:  y_cov = Qff + noise,                   trace_term = tr(Kff-Qff) / noise
+        # y_cov = W @ W.T + D
+        # trace_term is added into log_prob
+
+        N = self.X.size(0)
+        M = self.Xu.size(0)
+        Kuu = self.kernel(self.Xu).contiguous()
+        Kuu.view(-1)[:: M + 1] += self.jitter  # add jitter to the diagonal
+        Luu = torch.linalg.cholesky(Kuu)  # the Cholesky decomposition of Kuu = Luu @ Luu.T
+        Kuf = self.kernel(self.Xu, self.X)
+        W = torch.linalg.solve_triangular(Luu, Kuf, upper=False).t()  # W = inv(Luu).T @ Kuf = Kfu @ inv(Luu).T (an approximation of Kfu @ inv(Kuu))
+
+        D = self.noise.expand(N)
+        if self.approx == "FITC" or self.approx == "VFE":
+            Kffdiag = self.kernel(self.X, diag=True)  # diagonal of Kff
+            Qffdiag = W.pow(2).sum(dim=-1)  # 
+            if self.approx == "FITC":
+                D = D + Kffdiag - Qffdiag
+            else:  # approx = "VFE"
+                trace_term = (Kffdiag - Qffdiag).sum() / self.noise
+                trace_term = trace_term.clamp(min=0)
+
+        zero_loc = self.X.new_zeros(self.y.shape)
+        f_loc = zero_loc + self.mean_function(self.X)
+        if self.y is None:
+            f_var = D + W.pow(2).sum(dim=-1)
+            return f_loc, f_var
+        else:
+            if self.approx == "VFE":
+                pyro.factor(self._pyro_get_fullname("trace_term"), -trace_term / 2.0)
+            print(f"f_loc shape: {f_loc.shape}")  # Should match y.shape
+            print(f"W shape: {W.shape}")
+            print(f"D shape: {D.shape}")
+            print(f"y shape: {self.y.shape if self.y is not None else None}")
+            
+            return pyro.sample(
+                self._pyro_get_fullname("y"),
+                dist.LowRankMultivariateNormal(f_loc, W, D)
+                # .expand_by(self.y.shape[:-1])
+                .to_event(self.y.dim() - 1),
+                obs=self.y,
+            )
+
+    @pyro_method
+    def guide(self):
+        self.set_mode("guide")
+        self._load_pyro_samples()
+
+    def forward(self, Xnew, full_cov=False, noiseless=True):
+        r"""
+        Computes the mean and covariance matrix (or variance) of Gaussian Process
+        posterior on a test input data :math:`X_{new}`:
+
+        .. math:: p(f^* \mid X_{new}, X, y, k, X_u, \epsilon) = \mathcal{N}(loc, cov).
+
+        .. note:: The noise parameter ``noise`` (:math:`\epsilon`), the inducing-point
+            parameter ``Xu``, together with kernel's parameters have been learned from
+            a training procedure (MCMC or SVI).
+
+        :param torch.Tensor Xnew: A input data for testing. Note that
+            ``Xnew.shape[1:]`` must be the same as ``self.X.shape[1:]``.
+        :param bool full_cov: A flag to decide if we want to predict full covariance
+            matrix or just variance.
+        :param bool noiseless: A flag to decide if we want to include noise in the
+            prediction output or not.
+        :returns: loc and covariance matrix (or variance) of :math:`p(f^*(X_{new}))`
+        :rtype: tuple(torch.Tensor, torch.Tensor)
+        """
+        self._check_Xnew_shape(Xnew)
+        self.set_mode("guide")
+
+        # W = inv(Luu) @ Kuf
+        # Ws = inv(Luu) @ Kus
+        # D as in self.model()
+        # K = I + W @ inv(D) @ W.T = L @ L.T
+        # S = inv[Kuu + Kuf @ inv(D) @ Kfu]
+        #   = inv(Luu).T @ inv[I + inv(Luu)@ Kuf @ inv(D)@ Kfu @ inv(Luu).T] @ inv(Luu)
+        #   = inv(Luu).T @ inv[I + W @ inv(D) @ W.T] @ inv(Luu)
+        #   = inv(Luu).T @ inv(K) @ inv(Luu)
+        #   = inv(Luu).T @ inv(L).T @ inv(L) @ inv(Luu)
+        # loc = Ksu @ S @ Kuf @ inv(D) @ y = Ws.T @ inv(L).T @ inv(L) @ W @ inv(D) @ y
+        # cov = Kss - Ksu @ inv(Kuu) @ Kus + Ksu @ S @ Kus
+        #     = kss - Ksu @ inv(Kuu) @ Kus + Ws.T @ inv(L).T @ inv(L) @ Ws
+
+        N = self.X.size(0)
+        M = self.Xu.size(0)
+
+        # TODO: cache these calculations to get faster inference
+
+        Kuu = self.kernel(self.Xu).contiguous()
+        Kuu.view(-1)[:: M + 1] += self.jitter  # add jitter to the diagonal
+        Luu = torch.linalg.cholesky(Kuu)
+
+        Kuf = self.kernel(self.Xu, self.X)
+
+        W = torch.linalg.solve_triangular(Luu, Kuf, upper=False)
+        D = self.noise.expand(N)
+        if self.approx == "FITC":
+            Kffdiag = self.kernel(self.X, diag=True)
+            Qffdiag = W.pow(2).sum(dim=0)
+            D = D + Kffdiag - Qffdiag
+
+        W_Dinv = W / D
+        K = W_Dinv.matmul(W.t()).contiguous()
+        K.view(-1)[:: M + 1] += 1  # add identity matrix to K
+        L = torch.linalg.cholesky(K)
+
+        # get y_residual and convert it into 2D tensor for packing
+        y_residual = self.y - self.mean_function(self.X)
+        y_2D = y_residual.reshape(-1, N).t()
+        W_Dinv_y = W_Dinv.matmul(y_2D)
+
+        # End caching ----------
+
+        Kus = self.kernel(self.Xu, Xnew)
+        Ws = torch.linalg.solve_triangular(Luu, Kus, upper=False)
+        pack = torch.cat((W_Dinv_y, Ws), dim=1)
+        Linv_pack = torch.linalg.solve_triangular(L, pack, upper=False)
+        # unpack
+        Linv_W_Dinv_y = Linv_pack[:, : W_Dinv_y.shape[1]]
+        Linv_Ws = Linv_pack[:, W_Dinv_y.shape[1] :]
+
+        C = Xnew.size(0)
+        loc_shape = self.y.shape[:-1] + (C,)
+        loc = Linv_W_Dinv_y.t().matmul(Linv_Ws).reshape(loc_shape)
+
+        if full_cov:
+            Kss = self.kernel(Xnew).contiguous()
+            if not noiseless:
+                Kss.view(-1)[:: C + 1] += self.noise  # add noise to the diagonal
+            Qss = Ws.t().matmul(Ws)
+            cov = Kss - Qss + Linv_Ws.t().matmul(Linv_Ws)
+            cov_shape = self.y.shape[:-1] + (C, C)
+            cov = cov.expand(cov_shape)
+        else:
+            Kssdiag = self.kernel(Xnew, diag=True)
+            if not noiseless:
+                Kssdiag = Kssdiag + self.noise
+            Qssdiag = Ws.pow(2).sum(dim=0)
+            cov = Kssdiag - Qssdiag + Linv_Ws.pow(2).sum(dim=0)
+            cov_shape = self.y.shape[:-1] + (C,)
+            cov = cov.expand(cov_shape)
+
+        return loc + self.mean_function(Xnew), cov
+

@@ -516,15 +516,14 @@ class SparseGPRegression(GPModel):
         X_centered = X - X.mean(dim=1, keepdim=True)
         X_normalized = X_centered / X_centered.std(dim=1, keepdim=True)
         
-        # Calculate correlation matrix [n_genes, n_genes]
-        correlation_matrix = torch.mm(X_normalized, X_normalized.t()) / self.n_spots
+        # Calculate correlation matrix [n_spots, n_spots]
+        correlation_matrix = torch.mm(X_normalized.t(), X_normalized) / self.n_genes
         self.X = pyro.nn.PyroSample(
             dist.MultivariateNormal(
                 X,  # [n_genes, n_spots] mean
-                covariance_matrix=correlation_matrix  # [n_genes, n_genes] fixed correlation
+                covariance_matrix=correlation_matrix  # [n_spots, n_spots] covariance
             ).to_event(1)
         )
-        self.autoguide("X", dist.MultivariateNormal)
         
         Xu = stats.resample(Parameter(X), n_inducing)
         self.Xu = Parameter(Xu) if not isinstance(Xu, Parameter) else Xu
@@ -611,10 +610,24 @@ class SparseGPRegression(GPModel):
                 obs=self.y,
             )
 
+
     @pyro_method
     def guide(self):
         self.set_mode("guide")
+        # Load any existing PyroSample priors
         self._load_pyro_samples()
+        
+        # Learnable parameters for the guide
+        loc = pyro.param("X_loc", torch.zeros(self.n_genes, self.n_spots))
+        scale_tril = pyro.param(
+            "X_scale_tril",
+            torch.eye(self.n_spots).expand(self.n_genes, self.n_spots, self.n_spots),
+            constraint=constraints.lower_cholesky
+        )
+        with pyro.plate("genes", self.n_genes):
+            pyro.sample("X", dist.MultivariateNormal(loc, scale_tril=scale_tril))
+            
+        
 
     def forward(self, Xnew, full_cov=False, noiseless=True):
         r"""

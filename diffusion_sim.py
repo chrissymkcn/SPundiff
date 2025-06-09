@@ -502,8 +502,29 @@ class SparseGPRegression(GPModel):
             in_tiss_mask=in_tiss_mask, ttl_cnts=ttl_cnts) if mean_function is None else None
         super().__init__(X, y, kernel=kernel, mean_function=mean_function, jitter=jitter)
         
-        self.X = pyro.nn.PyroSample(dist.Normal(X, 0.1).to_event())   
-        self.autoguide("X", dist.Normal)
+        # gene_variances = PyroParam(
+        #     torch.ones(self.n_genes) * 0.1,
+        #     constraint=constraints.positive
+        # )
+        # self.X = pyro.nn.PyroSample(
+        #     dist.Normal(
+        #         X,  # [n_genes, n_spots] mean  
+        #         gene_variances.unsqueeze(1)  # [n_genes, 1] learnable variances
+        #     ).to_event(1)
+        # )
+        
+        X_centered = X - X.mean(dim=1, keepdim=True)
+        X_normalized = X_centered / X_centered.std(dim=1, keepdim=True)
+        
+        # Calculate correlation matrix [n_genes, n_genes]
+        correlation_matrix = torch.mm(X_normalized, X_normalized.t()) / self.n_spots
+        self.X = pyro.nn.PyroSample(
+            dist.MultivariateNormal(
+                X,  # [n_genes, n_spots] mean
+                covariance_matrix=correlation_matrix  # [n_genes, n_genes] fixed correlation
+            ).to_event(1)
+        )
+        self.autoguide("X", dist.MultivariateNormal)
         
         Xu = stats.resample(Parameter(X), n_inducing)
         self.Xu = Parameter(Xu) if not isinstance(Xu, Parameter) else Xu
@@ -633,15 +654,11 @@ class SparseGPRegression(GPModel):
 
         N = self.X.size(0)
         M = self.Xu.size(0)
-
         # TODO: cache these calculations to get faster inference
-
         Kuu = self.kernel(self.Xu).contiguous()
         Kuu.view(-1)[:: M + 1] += self.jitter  # add jitter to the diagonal
         Luu = torch.linalg.cholesky(Kuu)
-
         Kuf = self.kernel(self.Xu, self.X)
-
         W = torch.linalg.solve_triangular(Luu, Kuf, upper=False)
         D = self.noise.expand(N)
         if self.approx == "FITC":

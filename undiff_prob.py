@@ -3,9 +3,9 @@ from torch.nn import Parameter
 from functools import partial
 import pyro.contrib.gp as gp
 
-from diffusion_sim import SparseGPRegression
+from spDiff.SPUndiff.SPUndiff.diffusion_sim_backup import SparseGPRegression
 
-from undiff_model_torch_optim_global import undiff_global
+from undiff_model_torch_optim import undiff
 from sklearn.cluster import KMeans, AgglomerativeClustering, SpectralClustering, Birch
 from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 from sklearn.metrics import silhouette_score
@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt 
 
-class undiff_prob(undiff_global):
+class undiff_prob(undiff):
     def __init__(self, adata, n_jobs=1, metric='euclidean', optimizer='adam', optim_params=None):
         super().__init__(adata, n_jobs, metric, optimizer, optim_params)
 
@@ -25,29 +25,8 @@ class undiff_prob(undiff_global):
             if isinstance(value, torch.Tensor) and value.requires_grad:
                 value.requires_grad = False
 
-    def compute_res_count(self, params):
-        regs = params['regs']
-        invalid_qts = params['invalid_qts']
-        genes = self.gene_selected
-        out_tiss_filt, in_tiss_filt, out_tiss_sum, in_tiss_sum = self.prep(invalid_qts)
-        
-        batch_size = 10
-        res = []
-        for i, gene in enumerate(genes):
-            # Checkpointing for memory-efficient OT computation
-            if i % batch_size == 0:
-                print(f'Processing gene {i+1}/{len(genes)}: {gene}')
-            # Use checkpoint for memory-efficient OT computation
-            g_out, g_in = out_tiss_filt[:, i], in_tiss_filt[:, i]
-            g_outsum, g_insum = out_tiss_sum[i], in_tiss_sum[i]
-            # transported_in = self.gene_specific_adaptation(g_out, g_in, g_outsum, g_insum)
-            transported_in = self.gene_specific_adaptation(g_out, g_in, g_outsum, g_insum, regs[i])
-            res.append(transported_in)
-        self.res_count = torch.stack(res, dim=1)
-        
-
     @staticmethod
-    def model_init(algo, i):
+    def clustering_model_init(algo, i):
         if algo == KMeans:
             model = algo(n_clusters=i, init='k-means++', max_iter=300, n_init=10, random_state=0)
         elif algo == AgglomerativeClustering:
@@ -79,7 +58,7 @@ class undiff_prob(undiff_global):
             scs[f'{algo.__name__}'] = []
             # wcsses[f'{algo.__name__}'] = [] if algo == KMeans else None
             for i in cluster_range:
-                model = undiff_prob.model_init(algo, i)
+                model = undiff_prob.clustering_model_init(algo, i)
                 predicted_labels = model.fit_predict(data)
                 # if hasattr(model, 'inertia_'):
                 #     wcsses[f'{algo.__name__}'].append(model.inertia_)
@@ -129,7 +108,7 @@ class undiff_prob(undiff_global):
         # pca = PCA(n_components=optimal_pca).fit_transform(data)
         optimal_algo = np.unique(best_algos)[0]
         actual_algo = [algo for algo in methods if algo.__name__ == optimal_algo][0]
-        model = undiff_prob.model_init(actual_algo, optimal_clusters)
+        model = undiff_prob.clustering_model_init(actual_algo, optimal_clusters)
         cluster_labels = model.fit_predict(data)
         return {
             'cluster_labels': cluster_labels,
@@ -138,54 +117,111 @@ class undiff_prob(undiff_global):
             # 'pca': pca,
         }
     
-    def run_one_round(self, qts_prior=0.8, n_genes=None, add_genes=[], optim_params=None):
-        self.params.update(optim_params) if optim_params is not None else None
+    def run_initialization(self, qts_prior=0.8, n_genes=None, add_genes=[]):
         self.prep_genes_params(add_genes=add_genes, first_n_genes=n_genes)
         self.set_states(qts_prior=qts_prior)
         self.freeze_all()  # no need to update parameters during this round
-        self.run_ot({
-            'cost_weight_s': self.cost_weight_s,
-            'cost_weight_t': self.cost_weight_t,
+        # self.cost_matrix_calculation(cost_weight_s, cost_weight_s) # for computing scaled cost matrix
+        self.cost_matrix_calculation(self.cost_weight_s, self.cost_weight_t) # for computing scaled cost matrix
+        self.compute_shared_OT(self.global_reg) # for updating warmstart
+        self.compute_res_count({
             'invalid_qts': self.invalid_qts,
             'regs': self.regs,
-            'global_reg': self.global_reg
         })
+        
+    def gene_initialization(self, gene_expr_out, gene_expr_in, out_sum, in_sum, reg):
+        """
+        Improved gene-specific adaptation using global OT plan as structural prior
+        
+        Args:
+            gene_expr_out: [n_spots] - source distribution for this gene
+            gene_expr_in: [n_spots] - target distribution for this gene  
+            reg: scalar - gene-specific regularization strength
+            
+        Returns:
+            transported_in: [n_spots] - adapted transport for this gene
+        """
+        global_ot = self.global_ot  # [n_spots, n_spots]
+        # Normalize gene-specific distributions
+        p = gene_expr_out / (gene_expr_out.sum())  # Source
+        q = gene_expr_in / (gene_expr_in.sum())    # Target
+        # Compute scaling factors in log domain for stability
+        # Gene-specific adaptations
+        f = (p / (global_ot.sum(dim=1)))  # Source adaptation
+        g = (q / (global_ot.sum(dim=0)))  # Target adaptation
+        # Regularization - higher reg means stay closer to global plan
+        reg_weight = torch.sigmoid(reg)  # Maps reg ∈ (-∞,∞) to (0,1)
+        # Adapt the global plan
+        adapted_ot = (
+            global_ot
+            * (f.unsqueeze(1) ** reg_weight) # Adapt source
+            * (g.unsqueeze(0) ** reg_weight)     # Adapt target
+        )
+        # Compute transported mass
+        to_target = adapted_ot.sum(dim=0)  # [n_spots]
+        # Preserve original scale
+        transported_in = to_target * out_sum + gene_expr_in * in_sum
+        return transported_in
 
-    def get_clustered_embeddings(self, n_genes=100, qts_prior=0.8):
+    def compute_res_count(self, params):
+        regs = params['regs']
+        invalid_qts = params['invalid_qts']
+        genes = self.gene_selected
+        out_tiss_filt, in_tiss_filt, out_tiss_sum, in_tiss_sum = self.prep(invalid_qts)
+        
+        batch_size = 10
+        res = []
+        for i, gene in enumerate(genes):
+            # Checkpointing for memory-efficient OT computation
+            if i % batch_size == 0:
+                print(f'Processing gene {i+1}/{len(genes)}: {gene}')
+            # Use checkpoint for memory-efficient OT computation
+            g_out, g_in = out_tiss_filt[:, i], in_tiss_filt[:, i]
+            g_outsum, g_insum = out_tiss_sum[i], in_tiss_sum[i]
+            transported_in = self.gene_initialization(g_out, g_in, g_outsum, g_insum, regs[i])
+            # transported_in = self.compute_ot(g_out, g_in, g_outsum, g_insum, regs[i])
+            res.append(transported_in)
+        self.res_count = torch.stack(res, dim=1)
+        
+    def get_initialized_embeddings(self, n_genes=100, qts_prior=0.8, clustering=False):
         if self.res_count is None:
-            self.run_one_round(n_genes=n_genes, qts_prior=qts_prior)
+            self.run_initialization(n_genes=n_genes, qts_prior=qts_prior)
         res_count = self.res_count.detach().cpu().numpy().T  # Convert to numpy for clustering
-        res = undiff_prob.auto_cluster(res_count, starting_clusters=3, max_clusters=None)  # pass in transposed res_count to have genes as samples
-        self.gene_clusters = {self.gene_selected[i]: lab for i,lab in enumerate(res['cluster_labels'])}
-        # compute barycenters of each cluster
-        unique_clusters = np.unique(res['cluster_labels'])
-        gene_groups = {}
-        z_prior = {}
-        self.cluster_genes_dict = {}
-        for i in unique_clusters:
-            # get indices of genes in this cluster
-            cluster_genes_idx = torch.tensor(np.where(res['cluster_labels'] == i)[0])
-            self.cluster_genes_dict[i] = np.array(self.gene_selected)[np.where(res['cluster_labels'] == i)[0]]
-            separated_chunk = self.res_count[:, cluster_genes_idx]
-            print(type(separated_chunk))
-            # twod_genes = []
-            # for j in range(len(cluster_genes)):
-                # gene_twod = self.grid_embedding(separated_chunk[:, j])
-            #     gene_twod = gene_twod / gene_twod.sum()  # Normalize to sum to 1
-            #     twod_genes.append(torch.tensor(gene_twod))
-            # separated_chunk = torch.stack(twod_genes, dim=0)
-            gene_groups[i] = separated_chunk.clone()  # do not embed here, just use expression vector directly
-            z_prior[i] = torch.mean(separated_chunk, dim=1)
+        if clustering:
+            res = undiff_prob.auto_cluster(res_count, starting_clusters=3, max_clusters=None)  # pass in transposed res_count to have genes as samples
+            self.gene_clusters = {self.gene_selected[i]: lab for i,lab in enumerate(res['cluster_labels'])}
+            # compute barycenters of each cluster
+            unique_clusters = np.unique(res['cluster_labels'])
+            gene_groups = {}
+            z_prior = {}
+            self.cluster_genes_dict = {}
+            for i in unique_clusters:
+                # get indices of genes in this cluster
+                cluster_genes_idx = torch.tensor(np.where(res['cluster_labels'] == i)[0])
+                self.cluster_genes_dict[i] = np.array(self.gene_selected)[np.where(res['cluster_labels'] == i)[0]]
+                separated_chunk = self.res_count[:, cluster_genes_idx]
+                print(type(separated_chunk))
+                # twod_genes = []
+                # for j in range(len(cluster_genes)):
+                    # gene_twod = self.grid_embedding(separated_chunk[:, j])
+                #     gene_twod = gene_twod / gene_twod.sum()  # Normalize to sum to 1
+                #     twod_genes.append(torch.tensor(gene_twod))
+                # separated_chunk = torch.stack(twod_genes, dim=0)
+                gene_groups[i] = separated_chunk.clone()  # do not embed here, just use expression vector directly
+                z_prior[i] = torch.mean(separated_chunk, dim=1)
+        else:
+            z_prior = {}
         return gene_groups, z_prior, self.sub_count
 
-
-    def run_sgpr(self, n_genes=1000, qts_prior=0.8, train_steps=2000, figname='sgpr_loss_curve.png'):
+    def run_sgpr(self, n_genes=1000, qts_prior=0.8, train_steps=2000, 
+                noise=0.001, sgpr_approx='VFE',
+                figname='sgpr_loss_curve.png'):
         """
         Run Sparse GP Regression on the gene expression data.
         """
-        gene_groups, z_prior, sub_count = self.get_clustered_embeddings(n_genes=n_genes, qts_prior=qts_prior)
-        X = torch.cat([ts.T for ts in gene_groups.values()], dim=0)  # [n_genes, n_spots]
-        y = torch.tensor(sub_count, dtype=torch.float32)  # [n_spots, n_genes]
+        gene_groups, z_prior, sub_count = self.get_initialized_embeddings(n_genes=n_genes, qts_prior=qts_prior, clustering=False)
+        X = torch.cat([ts.T for ts in gene_groups.values()], dim=0) if isinstance(gene_groups, dict) else gene_groups
+        y = torch.tensor(sub_count, dtype=torch.float32) if not isinstance(sub_count, torch.Tensor) else sub_count
         kernel = gp.kernels.RBF(input_dim=X.shape[1], lengthscale=torch.ones(X.shape[1]))  # kernel input_dim is the number of features in X, which is the number of genes
         coords = self.coords - self.coords.mean(dim=0)  # center the coordinates
         ttl_cnts = self.adata.obs['total_counts'].values
@@ -193,7 +229,7 @@ class undiff_prob(undiff_global):
         
         gplvm = SparseGPRegression(X, y, kernel, 
                                 coords=coords, in_tiss_mask=self.in_tiss_mask, ttl_cnts=ttl_cnts,
-                                noise=torch.tensor(0.001), jitter=1e-5, approx='VFE', 
+                                noise=torch.tensor(noise), jitter=1e-5, approx=sgpr_approx, 
                                 )
         
         losses = gp.util.train(gplvm, num_steps=train_steps)

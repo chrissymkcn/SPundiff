@@ -10,6 +10,7 @@ from joblib import Parallel, delayed
 import pyro
 import pyro.distributions as dist
 from pyro.contrib.gp.models.model import GPModel
+from pyro.contrib import gp
 from pyro.nn.module import PyroParam, pyro_method
 import pyro.ops.stats as stats
 
@@ -501,18 +502,30 @@ class SparseGPRegression(GPModel):
         mean_function = partial(self.mean_function, coords=coords, ref_count=y,
             in_tiss_mask=in_tiss_mask, ttl_cnts=ttl_cnts) if mean_function is None else None
         super().__init__(X, y, kernel=kernel, mean_function=mean_function, jitter=jitter)
-                
+        
+        # gene_variances = PyroParam(
+        #     torch.ones(self.n_genes) * 0.1,
+        #     constraint=constraints.positive
+        # )
+        # self.X = pyro.nn.PyroSample(
+        #     dist.Normal(
+        #         X,  # [n_genes, n_spots] mean  
+        #         gene_variances.unsqueeze(1)  # [n_genes, 1] learnable variances
+        #     ).to_event(1)
+        # )
+        
         X_centered = X - X.mean(dim=1, keepdim=True)
         X_normalized = X_centered / X_centered.std(dim=1, keepdim=True)
+        
         # Calculate correlation matrix [n_spots, n_spots]
         correlation_matrix = torch.mm(X_normalized.t(), X_normalized) / self.n_genes
-        shared_scale_tril = torch.linalg.cholesky(correlation_matrix)
         self.X = pyro.nn.PyroSample(
-            lambda self: dist.MultivariateNormal(
-                loc=X,
-                scale_tril=shared_scale_tril  # shape: [n_spots, n_spots]
-            ).expand([self.n_genes]).to_event(1)  # set the spot dimension as event (multivariate dimension for each gene)
+            dist.MultivariateNormal(
+                X,  # [n_genes, n_spots] mean
+                covariance_matrix=correlation_matrix  # [n_spots, n_spots] covariance
+            ).to_event(1)
         )
+        self.autoguide("X", dist.MultivariateNormal)
         
         Xu = stats.resample(Parameter(X), n_inducing)
         self.Xu = Parameter(Xu) if not isinstance(Xu, Parameter) else Xu
@@ -599,26 +612,10 @@ class SparseGPRegression(GPModel):
                 obs=self.y,
             )
 
-
     @pyro_method
     def guide(self):
         self.set_mode("guide")
         self._load_pyro_samples()
-        # Mean per gene (shape: [n_genes, n_spots])
-        loc = pyro.param(
-            "X_loc",
-            torch.zeros(self.n_genes, self.n_spots, device=self.X.device)
-        )
-        # Shared Cholesky factor for all genes (shape: [n_spots, n_spots])
-        scale_tril = pyro.param(
-            "X_shared_scale_tril",
-            torch.eye(self.n_spots, device=self.X.device),
-            constraint=constraints.lower_cholesky
-        )
-        # Expand shared scale_tril to all genes (broadcasted)
-        scale_tril = scale_tril.expand(self.n_genes, -1, -1)
-        with pyro.plate("genes", self.n_genes):
-            pyro.sample("X", dist.MultivariateNormal(loc, scale_tril=scale_tril))
 
     def forward(self, Xnew, full_cov=False, noiseless=True):
         r"""
@@ -712,4 +709,121 @@ class SparseGPRegression(GPModel):
             cov = cov.expand(cov_shape)
 
         return loc + self.mean_function(Xnew), cov
+
+    def save(self, model, filename):
+        """
+        Save a trained SparseGPRegression model to a file.
+        
+        Parameters
+        ----------
+        model : SparseGPRegression
+            The model to save
+        filename : str
+            Path to save the model
+        """
+        # Extract model components
+        model_state = {
+            'X': model.X_loc.detach().cpu() if hasattr(model, 'X_loc') else model.X.detach().cpu(),
+            'y': model.y.detach().cpu(),
+            'Xu': model.Xu.detach().cpu(),
+            'noise': model.noise.detach().cpu(),
+            'kernel_state': {
+                'name': model.kernel.__class__.__name__,
+                'input_dim': model.kernel.input_dim,
+                'params': {
+                    param_name: getattr(model.kernel, param_name).detach().cpu()
+                    for param_name in model.kernel.state_dict().keys()
+                }
+            },
+            'jitter': model.jitter,
+            'approx': model.approx,
+        }
+        
+        # Save to file
+        torch.save(model_state, filename)
+        print(f"Model saved to {filename}")
+
+    def load(self, filename, custom_mean_func=None):
+        """
+        Load a SparseGPRegression model from a file.
+        
+        Parameters
+        ----------
+        filename : str
+            Path to the saved model
+        custom_mean_func : callable, default=None
+            Mean function to use, if None will use a default diffusion-based mean function
+            
+        Returns
+        -------
+        model : SparseGPRegression
+            Loaded SparseGPRegression model
+        """
+        # Load model state
+        model_state = torch.load(filename)
+        
+        # Recreate kernel
+        kernel_state = model_state['kernel_state']
+        
+        if kernel_state['name'] == 'RBF':
+            kernel = gp.kernels.RBF(
+                input_dim=kernel_state['input_dim'],
+                lengthscale=kernel_state['params']['lengthscale']
+            )
+        elif kernel_state['name'] == 'Matern32':
+            kernel = gp.kernels.Matern32(
+                input_dim=kernel_state['input_dim'],
+                lengthscale=kernel_state['params']['lengthscale']
+            )
+        elif kernel_state['name'] == 'Matern52':
+            kernel = gp.kernels.Matern52(
+                input_dim=kernel_state['input_dim'],
+                lengthscale=kernel_state['params']['lengthscale']
+            )
+        elif kernel_state['name'] == 'Periodic':
+            kernel = gp.kernels.Periodic(
+                input_dim=kernel_state['input_dim'],
+                lengthscale=kernel_state['params']['lengthscale'],
+                period=kernel_state['params']['period']
+            )
+        elif kernel_state['name'] == 'Linear':
+            kernel = gp.kernels.Linear(
+                input_dim=kernel_state['input_dim'],
+                variance=kernel_state['params']['variance']
+            )
+        else:
+            raise ValueError(f"Unsupported kernel type: {kernel_state['name']}")
+        
+        # Create model
+        # If no mean function provided, use the default
+        coords = self.coords - self.coords.mean(dim=0)  # center the coordinates
+        ttl_cnts = self.adata.obs['total_counts'].values
+        ttl_cnts = torch.tensor(ttl_cnts, dtype=torch.float32)
+        mean_func = partial(self.mean_function, coords=coords, sub_count=self.sub_count,
+                        in_tiss_mask=self.in_tiss_mask, ttl_cnts=ttl_cnts)
+        
+        # Create the model with loaded parameters
+        model = SparseGPRegression(
+            X=model_state['X'],
+            y=model_state['y'],
+            kernel=kernel,
+            Xu=model_state['Xu'],
+            noise=model_state['noise'],
+            jitter=model_state['jitter'],
+            approx=model_state['approx'],
+            mean_function=mean_func
+        )
+        
+        # Load metadata if available
+        if 'model_metadata' in model_state:
+            metadata = model_state['model_metadata']
+            if metadata.get('gene_indices') is not None:
+                self.gene_indices = torch.tensor(metadata['gene_indices'])
+            if metadata.get('gene_selected') is not None:
+                self.gene_selected = np.array(metadata['gene_selected'])
+            if metadata.get('cluster_genes_dict') is not None:
+                self.cluster_genes_dict = metadata['cluster_genes_dict']
+        
+        print(f"Model loaded from {filename}")
+        return model
 

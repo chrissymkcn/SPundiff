@@ -6,22 +6,6 @@ class undiff_global(undiff):
     def __init__(self, adata, n_jobs=1, metric='euclidean',optimizer='adam', optim_params=None):
         super().__init__(adata, n_jobs, metric, optimizer, optim_params)
 
-    def smooth_quantile_batch(self, x, q):
-        """Differentiable approximation of quantile"""
-        sorted_x, _ = torch.sort(x, dim=0)
-        n = x.shape[0]
-        index = (n - 1) * q  # q ∈ [0,1]
-
-        # Linear interpolation between adjacent values
-        lower = torch.floor(index).long()
-        upper = lower + 1
-        weight = index - lower
-
-        # For out-of-bound cases
-        upper = torch.clamp(upper, 0, n-1)
-        x_qvals = (1 - weight) * sorted_x[lower, torch.arange(sorted_x.size(1))] + weight * sorted_x[upper, torch.arange(sorted_x.size(1))] 
-        return x_qvals
-
     def gene_specific_adaptation(self, gene_expr_out, gene_expr_in, out_sum, in_sum, reg):
         """
         Improved gene-specific adaptation using global OT plan as structural prior
@@ -72,11 +56,10 @@ class undiff_global(undiff):
             # Use checkpoint for memory-efficient OT computation
             g_out, g_in = out_tiss_filt[:, i], in_tiss_filt[:, i]
             g_outsum, g_insum = out_tiss_sum[i], in_tiss_sum[i]
-            # transported_in = self.gene_specific_adaptation(g_out, g_in, g_outsum, g_insum)
             transported_in = self.gene_specific_adaptation(g_out, g_in, g_outsum, g_insum, regs[i])
             res.append(transported_in)
         self.res_count = torch.stack(res, dim=1)
- 
+
     def run_ot(self, params):
         cost_weight_s = params['cost_weight_s']
         cost_weight_t = params['cost_weight_t']

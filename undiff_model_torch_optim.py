@@ -68,7 +68,7 @@ class undiff():
     }
     
     def __init__(self, adata, n_jobs=1, metric='euclidean', 
-               optimizer='adam', optim_params=None):
+            optimizer='adam', optim_params=None):
         self.adata = adata.copy()
         self.var_names = adata.var_names
         self.sub_count = None
@@ -608,7 +608,7 @@ class undiff():
         c_mean = C.mean(dim=1, keepdim=True)
         c_sum = C.sum(axis=1, keepdims=True)
         if scale == 'by_max':
-            scaled_cost = C / c_max
+            scaled_cost = C / c_max  # normalized by each row (source)
         elif scale == 'by_minmax':
             scaled_cost = (C - c_min) / (c_max - c_min)
         elif scale == 'log':
@@ -965,8 +965,7 @@ class undiff():
 
     def compute_ot(self, out_tiss_filt, in_tiss_filt, out_tiss_sum, in_tiss_sum, reg):
         params = self.params
-        scaled_cost = self.scaled_cost    
-
+        scaled_cost = self.scaled_cost
         # print("Running OT...")
         time_start = time.time()
         warmstart = (self.alpha_prev, self.beta_prev) if self.alpha_prev is not None and self.beta_prev is not None else None

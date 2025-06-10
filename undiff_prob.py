@@ -3,7 +3,7 @@ from torch.nn import Parameter
 from functools import partial
 import pyro.contrib.gp as gp
 
-from spDiff.SPUndiff.SPUndiff.diffusion_sim_backup import SparseGPRegression, EarlyStopping
+from diffusion_sim import SparseGPRegression, EarlyStopping
 
 from undiff_model_torch_optim import undiff
 from sklearn.cluster import KMeans, AgglomerativeClustering, SpectralClustering, Birch
@@ -186,9 +186,8 @@ class undiff_prob(undiff):
     def get_initialized_embeddings(self, n_genes=100, qts_prior=0.8, clustering=False):
         if self.res_count is None:
             self.run_initialization(n_genes=n_genes, qts_prior=qts_prior)
-        res_count = self.res_count.detach().cpu().numpy().T  # Convert to numpy for clustering
         if clustering:
-            res = undiff_prob.auto_cluster(res_count, starting_clusters=3, max_clusters=None)  # pass in transposed res_count to have genes as samples
+            res = undiff_prob.auto_cluster(self.res_count.detach().cpu().numpy().T, starting_clusters=3, max_clusters=None)  # pass in transposed res_count to have genes as samples
             self.gene_clusters = {self.gene_selected[i]: lab for i,lab in enumerate(res['cluster_labels'])}
             # compute barycenters of each cluster
             unique_clusters = np.unique(res['cluster_labels'])
@@ -210,6 +209,7 @@ class undiff_prob(undiff):
                 gene_groups[i] = separated_chunk.clone()  # do not embed here, just use expression vector directly
                 z_prior[i] = torch.mean(separated_chunk, dim=1)
         else:
+            gene_groups = self.res_count.clone().T  # use the full gene expression matrix
             z_prior = {}
         return gene_groups, z_prior, self.sub_count
 
@@ -254,7 +254,6 @@ class undiff_prob(undiff):
 
             return model
 
-        
         trained_model = train_model(gplvm, num_epochs=train_steps, lr=0.01, patience=10, min_delta=0.5)
 
         losses = gp.util.train(gplvm, num_steps=train_steps)

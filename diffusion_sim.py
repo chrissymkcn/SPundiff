@@ -298,9 +298,9 @@ class SpatialDiffusionPDE(DiffusionPDE):
 
 class forward_diffusion():
     def __init__(self, 
-                grid_sizes: tuple|list|torch.tensor, 
-                voxel_sizes: tuple|list|torch.tensor, 
-                padding_sizes: tuple|list|torch.tensor,
+                grid_sizes: tuple, 
+                voxel_sizes: tuple, 
+                padding_sizes: tuple,
                 x: torch.Tensor,  # Shape: (n_coords,)
                 y: torch.Tensor,  # Shape: (n_coords,)
                 coords: torch.Tensor,  # Shape: (n_coords, 2) 
@@ -506,10 +506,16 @@ class SparseGPRegression(GPModel):
         X_normalized = X_centered / X_centered.std(dim=1, keepdim=True)
         # Calculate correlation matrix [n_spots, n_spots]
         correlation_matrix = torch.mm(X_normalized.t(), X_normalized) / self.n_genes
+        # Add small diagonal regularization to ensure positive-definiteness
+        epsilon = 1e-2
+        correlation_matrix += epsilon * torch.eye(correlation_matrix.size(0), device=correlation_matrix.device)
+        # Cholesky decomposition
         shared_scale_tril = torch.linalg.cholesky(correlation_matrix)
+
         self.X = pyro.nn.PyroSample(
             lambda self: dist.MultivariateNormal(
                 loc=X,
+                # covariance_matrix=correlation_matrix,
                 scale_tril=shared_scale_tril  # shape: [n_spots, n_spots]
             ).expand([self.n_genes]).to_event(1)  # set the spot dimension as event (multivariate dimension for each gene)
         )
@@ -812,8 +818,9 @@ class SparseGPRegression(GPModel):
             The loaded model
         """
         # Load Pyro parameters
-        pyro.get_param_store().load(f"{filename_prefix}.pt")
-
+        params = torch.load(f"{filename_prefix}.pt", weights_only=False)
+        pyro.get_param_store().set_state(params)
+        
         # Load metadata
         metadata = torch.load(f"{filename_prefix}_meta.pt")
 

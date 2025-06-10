@@ -10,6 +10,7 @@ from joblib import Parallel, delayed
 import pyro
 import pyro.distributions as dist
 from pyro.contrib.gp.models.model import GPModel
+from pyro.contrib import gp
 from pyro.nn.module import PyroParam, pyro_method
 import pyro.ops.stats as stats
 
@@ -174,7 +175,7 @@ def coords_to_filled_grid(
     padding_sizes,
     x: torch.Tensor,  # Shape: (n_coords,)
     coords: torch.Tensor = None,  # Shape: (n_coords, 2)
-) -> torch.Tensor:
+) :
     """
     Convert point observations to grid x with gap filling
     
@@ -296,10 +297,33 @@ class SpatialDiffusionPDE(DiffusionPDE):
 
 
 class forward_diffusion():
-    def __init__(self, grid_sizes, voxel_sizes, padding_sizes,
-                x, y, coords, in_tiss_mask, ttl_cnts,
+    def __init__(self, 
+                grid_sizes: tuple|list|torch.tensor, 
+                voxel_sizes: tuple|list|torch.tensor, 
+                padding_sizes: tuple|list|torch.tensor,
+                x: torch.Tensor,  # Shape: (n_coords,)
+                y: torch.Tensor,  # Shape: (n_coords,)
+                coords: torch.Tensor,  # Shape: (n_coords, 2) 
+                out_tissue_mask: np.ndarray,
+                diff_mask: np.ndarray,  
                 diffusivity=0.2, noise=0.01, 
                 ):
+        '''
+        Simulate 2d spatial diffusion from initial condition x to reference condition y. 
+        
+        Args:
+            grid_sizes: a tuple or list of two integers defining the grid size (n_x, n_y)
+            voxel_sizes: a tuple or list of two floats defining the voxel size (dx, dy)
+            padding_sizes: a tuple or list of two floats defining the padding size (pad_x, pad_y) at the scale of original coordinate space (not grids)
+            x: a 1D tensor of shape (n_coords,) representing the initial condition at coordinates
+            y: a 1D tensor of shape (n_coords,) representing the reference condition at coordinates (for restraining the diffusion)
+            out_tissue_mask: a 1D tensor of shape (n_coords,) representing the mask for out-tissue regions (0 for out-of-tissue)
+            coords: a 2D tensor of shape (n_coords, 2) representing the coordinates of the points
+            diff_mask: a 2D tensor or list of shape (n_coords,) representing the total counts at each coordinate
+            diffusivity: a float representing the diffusivity coefficient (default: 0.2)
+            noise: a float representing the noise amplitude (default: 0.01)
+        '''
+        
         self.grid_sizes = grid_sizes
         self.voxel_sizes = voxel_sizes
         self.padding_sizes = padding_sizes
@@ -308,8 +332,8 @@ class forward_diffusion():
         self.coords = coords
         self.diffusivity = diffusivity
         self.noise = noise
-        self.in_tiss_mask = in_tiss_mask
-        self.ttl_cnts = ttl_cnts
+        self.out_tissue_mask = out_tissue_mask
+        self.diff_mask = diff_mask
 
     @staticmethod
     def post_step_hook(state_data, t, threshold):
@@ -321,8 +345,8 @@ class forward_diffusion():
         x_grid = grids['x_grid']
         y_grid = grids['y_grid']
         grid_coords = grids['grid_coords']
-        out_tissue_mask = grids['out_tissue_mask']
-        diff_mask = grids['diff_mask']
+        out_tissue_mask = self.out_tissue_mask
+        diff_mask = self.diff_mask
         
         # diff params 
         diffusivity = self.diffusivity
@@ -350,9 +374,6 @@ class forward_diffusion():
         x = self.x
         coords = self.coords
         y = self.y
-        in_tiss_mask = self.in_tiss_mask
-        out_tiss_mask = (in_tiss_mask==0).int()
-        ttl_cnts = self.ttl_cnts
         
         x_grid, grid_coords = coords_to_filled_grid(
             grid_size=grid_sizes,
@@ -372,31 +393,10 @@ class forward_diffusion():
             coords=coords
         )[0]
 
-        #### Custom noise spatially dependent
-        out_tissue_mask = coords_to_filled_grid(
-            grid_size=grid_sizes,
-            dx=voxel_sizes[0],
-            dy=voxel_sizes[1],
-            padding_sizes=padding_sizes,
-            x=out_tiss_mask,
-            coords=coords
-        )[0]
-        ttl_cnts = torch.tensor(ttl_cnts, dtype=torch.float32)
-        ttl_grid = coords_to_filled_grid(
-            grid_size=grid_sizes,
-            dx=voxel_sizes[0],
-            dy=voxel_sizes[1],
-            padding_sizes=padding_sizes,
-            x=ttl_cnts,
-            coords=coords
-        )[0]
-        diff_mask = ttl_grid / ttl_grid.max()  # normalize to [0, 1]
         return {
             'x_grid': x_grid.detach().numpy() if x_grid.requires_grad else x_grid.numpy(),
             'y_grid': y_grid.detach().numpy() if y_grid.requires_grad else y_grid.numpy(),
             'grid_coords': grid_coords.detach().numpy() if grid_coords.requires_grad else grid_coords.numpy(),
-            'out_tissue_mask': out_tissue_mask.detach().numpy() if out_tissue_mask.requires_grad else out_tissue_mask.numpy(),
-            'diff_mask': diff_mask.detach().numpy() if diff_mask.requires_grad else diff_mask.numpy()
         }
 
 class SparseGPRegression(GPModel):
@@ -486,7 +486,7 @@ class SparseGPRegression(GPModel):
     def __init__(
         self, X, y, kernel, 
         coords, in_tiss_mask, ttl_cnts,
-        noise=None, mean_function=None, approx=None, jitter=1e-6
+        noise=None, approx=None, jitter=1e-6
     ):
         assert isinstance(
             X, torch.Tensor
@@ -499,7 +499,7 @@ class SparseGPRegression(GPModel):
         self.n_genes, self.n_spots = X.shape
         n_inducing = int(torch.sqrt(torch.tensor(self.n_genes)))  # number of inducing points
         mean_function = partial(self.mean_function, coords=coords, ref_count=y,
-            in_tiss_mask=in_tiss_mask, ttl_cnts=ttl_cnts) if mean_function is None else None
+            in_tiss_mask=in_tiss_mask, ttl_cnts=ttl_cnts)
         super().__init__(X, y, kernel=kernel, mean_function=mean_function, jitter=jitter)
                 
         X_centered = X - X.mean(dim=1, keepdim=True)
@@ -533,18 +533,41 @@ class SparseGPRegression(GPModel):
     @staticmethod
     def mean_function(X, coords, ref_count, in_tiss_mask, ttl_cnts):
         domain_sizes, grid_sizes, voxel_sizes, diffusion_const, padding_sizes = calculate_domain_parameters(coords, divideby=1)
+        out_tiss_mask = (in_tiss_mask==0).int()
+        #### Custom noise spatially dependent
+        out_tissue_mask = coords_to_filled_grid(
+            grid_size=grid_sizes,
+            dx=voxel_sizes[0],
+            dy=voxel_sizes[1],
+            padding_sizes=padding_sizes,
+            x=out_tiss_mask,
+            coords=coords
+        )[0]
+        out_tissue_mask = out_tissue_mask.detach().numpy() if out_tissue_mask.requires_grad else out_tissue_mask.numpy()
+        ttl_cnts = torch.tensor(ttl_cnts, dtype=torch.float32) if not isinstance(ttl_cnts, torch.Tensor) else ttl_cnts
+        ttl_grid = coords_to_filled_grid(
+            grid_size=grid_sizes,
+            dx=voxel_sizes[0],
+            dy=voxel_sizes[1],
+            padding_sizes=padding_sizes,
+            x=ttl_cnts,
+            coords=coords
+        )[0]
+        diff_mask = ttl_grid / ttl_grid.max()  # normalize to [0, 1]
+        diff_mask = diff_mask.detach().numpy() if diff_mask.requires_grad else diff_mask.numpy()
 
         def process(i):
             x = X[i, :]
             y = ref_count[:, i]
             model = forward_diffusion(
                 grid_sizes=grid_sizes, voxel_sizes=voxel_sizes, padding_sizes=padding_sizes,
-                x=x, y=y, coords=coords, in_tiss_mask=in_tiss_mask, ttl_cnts=ttl_cnts,
+                x=x, y=y, coords=coords, 
+                out_tissue_mask=out_tissue_mask, diff_mask=diff_mask,
                 diffusivity=0.2, noise=0.01,
             )
             return torch.tensor(model.run(), dtype=torch.float32)
 
-        res = Parallel(n_jobs=-1)(delayed(process)(i) for i in range(X.shape[0]))
+        res = Parallel(n_jobs=-1, batch=10)(delayed(process)(i) for i in range(X.shape[0]))
         return torch.stack(res, dim=0).T
 
     @pyro_method
@@ -713,3 +736,174 @@ class SparseGPRegression(GPModel):
 
         return loc + self.mean_function(Xnew), cov
 
+    def infer(self, Xnew, full_cov=False, noiseless=True):
+        """
+        Run inference on new data using the trained SparseGPRegression model.
+
+        Parameters
+        ----------
+        Xnew : torch.Tensor
+            New input data for prediction (shape: [n_test, input_dim]).
+        full_cov : bool, optional
+            Whether to return full covariance matrix. Default is False.
+        noiseless : bool, optional
+            Whether to exclude noise in the prediction. Default is True.
+
+        Returns
+        -------
+        loc : torch.Tensor
+            Posterior mean of the predictions.
+        cov : torch.Tensor
+            Posterior variance or covariance matrix of the predictions.
+        """
+        self.eval()
+        with torch.no_grad():
+            loc, cov = self.forward(Xnew, full_cov=full_cov, noiseless=noiseless)
+        return loc, cov
+
+
+    def save(self, filename_prefix):
+        """
+        Save the model parameters and metadata using Pyro's param store.
+
+        Parameters
+        ----------
+        filename_prefix : str
+            Prefix for the saved files (e.g., 'model' will create 'model.pt' and 'model_meta.pt')
+        """
+        # Save Pyro parameters
+        pyro.get_param_store().save(f"{filename_prefix}.pt")
+
+        # Save metadata separately
+        metadata = {
+            'coords': self.coords.detach().cpu(),
+            'in_tiss_mask': self.in_tiss_mask.detach().cpu(),
+            'ttl_cnts': self.ttl_cnts.detach().cpu(),
+            'approx': self.approx,
+            'jitter': self.jitter,
+            'Xu': self.Xu.detach().cpu(),
+            'X': self.X.detach().cpu(),
+            'y': self.y.detach().cpu() if self.y is not None else None,
+            'kernel_state': {
+                'name': self.kernel.__class__.__name__,
+                'input_dim': self.kernel.input_dim,
+                'params': {k: v.detach().cpu() for k, v in self.kernel.named_parameters()}
+            }
+        }
+        torch.save(metadata, f"{filename_prefix}_meta.pt")
+        print(f"Model saved to {filename_prefix}.pt and metadata to {filename_prefix}_meta.pt")
+
+
+    @staticmethod
+    def load(filename_prefix, custom_mean_func=None):
+        """
+        Load the model parameters and metadata using Pyro's param store.
+
+        Parameters
+        ----------
+        filename_prefix : str
+            Prefix for the saved files (e.g., 'model' will load 'model.pt' and 'model_meta.pt')
+        custom_mean_func : callable, optional
+            Custom mean function to override the default
+
+        Returns
+        -------
+        model : SparseGPRegression
+            The loaded model
+        """
+        # Load Pyro parameters
+        pyro.get_param_store().load(f"{filename_prefix}.pt")
+
+        # Load metadata
+        metadata = torch.load(f"{filename_prefix}_meta.pt")
+
+        # Reconstruct kernel
+        kernel_name = metadata['kernel_state']['name']
+        input_dim = metadata['kernel_state']['input_dim']
+        params = metadata['kernel_state']['params']
+
+        if kernel_name == 'RBF':
+            kernel = gp.kernels.RBF(input_dim=input_dim)
+        elif kernel_name == 'Matern32':
+            kernel = gp.kernels.Matern32(input_dim=input_dim)
+        elif kernel_name == 'Matern52':
+            kernel = gp.kernels.Matern52(input_dim=input_dim)
+        elif kernel_name == 'Periodic':
+            kernel = gp.kernels.Periodic(input_dim=input_dim)
+        elif kernel_name == 'Linear':
+            kernel = gp.kernels.Linear(input_dim=input_dim)
+        else:
+            raise ValueError(f"Unsupported kernel type: {kernel_name}")
+
+        for name, param in params.items():
+            getattr(kernel, name).data = param
+
+        # Reconstruct model
+        model = SparseGPRegression(
+            X=metadata['X'],
+            y=metadata['y'],
+            kernel=kernel,
+            coords=metadata['coords'],
+            in_tiss_mask=metadata['in_tiss_mask'],
+            ttl_cnts=metadata['ttl_cnts'],
+            noise=pyro.param("noise") if "noise" in pyro.get_param_store().keys() else None,
+            approx=metadata['approx'],
+            jitter=metadata['jitter']
+        )
+
+        print(f"Model loaded from {filename_prefix}.pt and metadata from {filename_prefix}_meta.pt")
+        return model
+
+
+    def infer_latent_X_quantiles(self, quantiles=[0.05, 0.5, 0.95], n_samples=1000):
+        """
+        Sample from the posterior of X and compute quantiles.
+
+        Parameters
+        ----------
+        quantiles : list of float
+            Quantiles to compute (e.g., [0.05, 0.5, 0.95]).
+        n_samples : int
+            Number of posterior samples to draw.
+
+        Returns
+        -------
+        torch.Tensor
+            Quantile estimates of X with shape [len(quantiles), n_genes, n_spots].
+        """
+        self.set_mode("guide")
+        self._load_pyro_samples()
+
+        loc = pyro.param("X_loc")
+        scale_tril = pyro.param("X_shared_scale_tril")
+        dist_X = dist.MultivariateNormal(loc, scale_tril=scale_tril)
+
+        samples = dist_X.sample((n_samples,))
+        return torch.quantile(samples, torch.tensor(quantiles), dim=0)
+    
+
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=0.0, mode='min'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.best_score = None
+        self.counter = 0
+        self.early_stop = False
+
+    def __call__(self, current_score):
+        if self.best_score is None:
+            self.best_score = current_score
+            return False
+
+        improvement = (current_score < self.best_score - self.min_delta) if self.mode == 'min' else (current_score > self.best_score + self.min_delta)
+
+        if improvement:
+            self.best_score = current_score
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
+        return self.early_stop

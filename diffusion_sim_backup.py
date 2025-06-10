@@ -382,7 +382,7 @@ class forward_diffusion():
             x=out_tiss_mask,
             coords=coords
         )[0]
-        ttl_cnts = torch.tensor(ttl_cnts, dtype=torch.float32)
+        ttl_cnts = torch.tensor(ttl_cnts, dtype=torch.float32) if not isinstance(ttl_cnts, torch.Tensor) else ttl_cnts
         ttl_grid = coords_to_filled_grid(
             grid_size=grid_sizes,
             dx=voxel_sizes[0],
@@ -737,6 +737,11 @@ class SparseGPRegression(GPModel):
             },
             'jitter': model.jitter,
             'approx': model.approx,
+            'model_metadata': {
+                'in_tiss_mask': model.in_tiss_mask.detach().cpu().numpy() if hasattr(model, 'in_tiss_mask') else None,
+                'coords': model.coords.detach().cpu().numpy() if hasattr(model, 'coords') else None,
+                'ttl_cnts': model.ttl_cnts.detach().cpu().numpy() if hasattr(model, 'ttl_cnts') else None,
+            }
         }
         
         # Save to file

@@ -3,7 +3,7 @@ from torch.nn import Parameter
 from functools import partial
 import pyro.contrib.gp as gp
 
-from spDiff.SPUndiff.SPUndiff.diffusion_sim_backup import SparseGPRegression
+from spDiff.SPUndiff.SPUndiff.diffusion_sim_backup import SparseGPRegression, EarlyStopping
 
 from undiff_model_torch_optim import undiff
 from sklearn.cluster import KMeans, AgglomerativeClustering, SpectralClustering, Birch
@@ -232,6 +232,31 @@ class undiff_prob(undiff):
                                 noise=torch.tensor(noise), jitter=1e-5, approx=sgpr_approx, 
                                 )
         
+        from pyro.infer import SVI, TraceMeanField_ELBO
+        from pyro.optim import ClippedAdam
+
+        def train_model(model, num_epochs=1000, lr=0.01, patience=10, min_delta=1.0):
+            # Setup optimizer and ELBO
+            optimizer = ClippedAdam({"lr": lr})
+            elbo = TraceMeanField_ELBO()
+            svi = SVI(model.model, model.guide, optimizer, loss=elbo)
+
+            # Early stopping monitor
+            early_stopper = EarlyStopping(patience=patience, min_delta=min_delta, mode='min')
+
+            for epoch in range(num_epochs):
+                loss = svi.step()
+                print(f"Epoch {epoch}, ELBO loss: {loss:.4f}")
+
+                if early_stopper(loss):
+                    print("Early stopping triggered.")
+                    break
+
+            return model
+
+        
+        trained_model = train_model(gplvm, num_epochs=train_steps, lr=0.01, patience=10, min_delta=0.5)
+
         losses = gp.util.train(gplvm, num_steps=train_steps)
         
         # let's plot the loss curve after 4000 steps of training

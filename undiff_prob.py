@@ -3,27 +3,25 @@ from torch.nn import Parameter
 from functools import partial
 import pyro.contrib.gp as gp
 
-from diffusion_sim import SparseGPRegression, EarlyStopping
+from diffusion_sim import SparseGPRegression, EarlyStopping, PhysicsInformedDiffusionModel
+import pyro
 
-from undiff_model_torch_optim import undiff
+from base import base
 from sklearn.cluster import KMeans, AgglomerativeClustering, SpectralClustering, Birch
 from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 from sklearn.metrics import silhouette_score
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from scipy.sparse import issparse
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt 
+import scanpy as sc 
 
-class undiff_prob(undiff):
-    def __init__(self, adata, n_jobs=1, metric='euclidean', optimizer='adam', optim_params=None):
-        super().__init__(adata, n_jobs, metric, optimizer, optim_params)
-
-    def freeze_all(self):
-        for name, value in vars(self).items():
-            if isinstance(value, torch.Tensor) and value.requires_grad:
-                value.requires_grad = False
+class undiff(base):
+    def __init__(self, adata, n_neighs=15):
+        super().__init__(adata, n_neighs=n_neighs)
 
     @staticmethod
     def clustering_model_init(algo, i):
@@ -58,7 +56,7 @@ class undiff_prob(undiff):
             scs[f'{algo.__name__}'] = []
             # wcsses[f'{algo.__name__}'] = [] if algo == KMeans else None
             for i in cluster_range:
-                model = undiff_prob.clustering_model_init(algo, i)
+                model = undiff.clustering_model_init(algo, i)
                 predicted_labels = model.fit_predict(data)
                 # if hasattr(model, 'inertia_'):
                 #     wcsses[f'{algo.__name__}'].append(model.inertia_)
@@ -90,7 +88,7 @@ class undiff_prob(undiff):
         for n_pca in range(5, min(30, data.shape[0]), 5):
             pca = PCA(n_components=n_pca)
             data_pca = pca.fit_transform(data)
-            top_ncl, algo = undiff_prob.find_optimal_ncls(data_pca, methods, max_clusters=max_clusters, starting_clusters=starting_clusters)
+            top_ncl, algo = undiff.find_optimal_ncls(data_pca, methods, max_clusters=max_clusters, starting_clusters=starting_clusters)
             pca_silhouette_scores[n_pca] = top_ncl
             best_algos.append(algo)
         
@@ -108,7 +106,7 @@ class undiff_prob(undiff):
         # pca = PCA(n_components=optimal_pca).fit_transform(data)
         optimal_algo = np.unique(best_algos)[0]
         actual_algo = [algo for algo in methods if algo.__name__ == optimal_algo][0]
-        model = undiff_prob.clustering_model_init(actual_algo, optimal_clusters)
+        model = undiff.clustering_model_init(actual_algo, optimal_clusters)
         cluster_labels = model.fit_predict(data)
         return {
             'cluster_labels': cluster_labels,
@@ -120,51 +118,55 @@ class undiff_prob(undiff):
     def run_initialization(self, qts_prior=0.8, n_genes=None, add_genes=[]):
         self.prep_genes_params(add_genes=add_genes, first_n_genes=n_genes)
         self.set_states(qts_prior=qts_prior)
-        self.freeze_all()  # no need to update parameters during this round
-        # self.cost_matrix_calculation(cost_weight_s, cost_weight_s) # for computing scaled cost matrix
-        self.cost_matrix_calculation(self.cost_weight_s, self.cost_weight_t) # for computing scaled cost matrix
-        self.compute_shared_OT(self.global_reg) # for updating warmstart
+        # self.compute_shared_OT(self.global_reg) # for updating warmstart
         self.compute_res_count({
             'invalid_qts': self.invalid_qts,
-            'regs': self.regs,
         })
         
-    def gene_initialization(self, gene_expr_out, gene_expr_in, out_sum, in_sum, reg):
+    def gene_initialization(self, gene_expr_out, gene_expr_in, out_sum, in_sum):
         """
-        Improved gene-specific adaptation using global OT plan as structural prior
+        Distribute mass from out-of-tissue spots to in-tissue spots based on:
+        1. Spatial proximity (from coord_cost matrix)
+        2. Likelihood weights (from gene_expr_in values)
         
         Args:
-            gene_expr_out: [n_spots] - source distribution for this gene
-            gene_expr_in: [n_spots] - target distribution for this gene  
-            reg: scalar - gene-specific regularization strength
+            gene_expr_out: [n_spots] - source distribution (out-of-tissue)
+            gene_expr_in: [n_spots] - target distribution weights (in-tissue)  
+            out_sum: scalar - total mass to distribute from out-of-tissue
+            in_sum: scalar - total mass already in-tissue
             
         Returns:
             transported_in: [n_spots] - adapted transport for this gene
         """
-        global_ot = self.global_ot  # [n_spots, n_spots]
-        # Normalize gene-specific distributions
-        p = gene_expr_out / (gene_expr_out.sum())  # Source
-        q = gene_expr_in / (gene_expr_in.sum())    # Target
-        # Compute scaling factors in log domain for stability
-        # Gene-specific adaptations
-        f = (p / (global_ot.sum(dim=1)))  # Source adaptation
-        g = (q / (global_ot.sum(dim=0)))  # Target adaptation
-        # Regularization - higher reg means stay closer to global plan
-        reg_weight = torch.sigmoid(reg)  # Maps reg ∈ (-∞,∞) to (0,1)
-        # Adapt the global plan
-        adapted_ot = (
-            global_ot
-            * (f.unsqueeze(1) ** reg_weight) # Adapt source
-            * (g.unsqueeze(0) ** reg_weight)     # Adapt target
-        )
-        # Compute transported mass
-        to_target = adapted_ot.sum(dim=0)  # [n_spots]
+        # Normalize inputs
+        p = gene_expr_out / (gene_expr_out.sum() + 1e-8)  # Source distribution (normalized)
+        q = gene_expr_in / (gene_expr_in.sum() + 1e-8)    # Target weights (normalized)
+        
+        # Get spatial cost matrix (precomputed in base class)
+        C = self.coord_cost  # [n_spots, n_spots]
+        
+        # Create combined cost matrix incorporating both spatial distance and target weights
+        # We want spots that are both close and have high expression to receive more mass
+        # So we take the inverse of distance (closer = higher value) and multiply by target weights
+        with torch.no_grad():
+            # Avoid division by zero for spatial cost
+            spatial_affinity = 1.0 / (1.0 + C)  # [n_spots, n_spots], closer spots have higher affinity
+            
+            # Combine spatial affinity with target weights
+            combined_cost = spatial_affinity * q.unsqueeze(0)  # [n_spots, n_spots]
+            
+            # Normalize rows to create a probability distribution for each source spot
+            transport_plan = combined_cost / (combined_cost.sum(dim=1, keepdim=True) + 1e-8)
+        
+        # Distribute the source mass according to the transport plan
+        transported_mass = torch.matmul(p.unsqueeze(0), transport_plan).squeeze(0)  # [n_spots]
+        
         # Preserve original scale
-        transported_in = to_target * out_sum + gene_expr_in * in_sum
+        transported_in = transported_mass * out_sum + gene_expr_in * in_sum
+        
         return transported_in
-
+    
     def compute_res_count(self, params):
-        regs = params['regs']
         invalid_qts = params['invalid_qts']
         genes = self.gene_selected
         out_tiss_filt, in_tiss_filt, out_tiss_sum, in_tiss_sum = self.prep(invalid_qts)
@@ -178,16 +180,16 @@ class undiff_prob(undiff):
             # Use checkpoint for memory-efficient OT computation
             g_out, g_in = out_tiss_filt[:, i], in_tiss_filt[:, i]
             g_outsum, g_insum = out_tiss_sum[i], in_tiss_sum[i]
-            transported_in = self.gene_initialization(g_out, g_in, g_outsum, g_insum, regs[i])
+            transported_in = self.gene_initialization(g_out, g_in, g_outsum, g_insum)
             # transported_in = self.compute_ot(g_out, g_in, g_outsum, g_insum, regs[i])
             res.append(transported_in)
         self.res_count = torch.stack(res, dim=1)
+        self.round_counts_to_integers()
         
     def get_initialized_embeddings(self, n_genes=100, qts_prior=0.8, clustering=False):
-        if self.res_count is None:
-            self.run_initialization(n_genes=n_genes, qts_prior=qts_prior)
+        self.run_initialization(n_genes=n_genes, qts_prior=qts_prior)
         if clustering:
-            res = undiff_prob.auto_cluster(self.res_count.detach().cpu().numpy().T, starting_clusters=3, max_clusters=None)  # pass in transposed res_count to have genes as samples
+            res = undiff.auto_cluster(self.res_count.detach().cpu().numpy().T, starting_clusters=3, max_clusters=None)  # pass in transposed res_count to have genes as samples
             self.gene_clusters = {self.gene_selected[i]: lab for i,lab in enumerate(res['cluster_labels'])}
             # compute barycenters of each cluster
             unique_clusters = np.unique(res['cluster_labels'])
@@ -202,71 +204,190 @@ class undiff_prob(undiff):
                 print(type(separated_chunk))
                 # twod_genes = []
                 # for j in range(len(cluster_genes)):
-                    # gene_twod = self.grid_embedding(separated_chunk[:, j])
+                    # gene_twod = self.shifted_grid_embedding(separated_chunk[:, j])
                 #     gene_twod = gene_twod / gene_twod.sum()  # Normalize to sum to 1
                 #     twod_genes.append(torch.tensor(gene_twod))
                 # separated_chunk = torch.stack(twod_genes, dim=0)
                 gene_groups[i] = separated_chunk.clone()  # do not embed here, just use expression vector directly
                 z_prior[i] = torch.mean(separated_chunk, dim=1)
-        else:
-            gene_groups = self.res_count.clone().T  # use the full gene expression matrix
-            z_prior = {}
-        return gene_groups, z_prior, self.sub_count
+            self.res_count = torch.cat([ts for ts in gene_groups.values()], dim=0).T
+        return self.res_count, self.sub_count
+    
 
-    def run_sgpr(self, n_genes=1000, qts_prior=0.8, train_steps=2000, 
-                noise=0.001, sgpr_approx='VFE',
-                figname='sgpr_loss_curve.png'):
+    def define_sgpr(self, X=None, y=None,
+                n_genes=1000, qts_prior=0.8, 
+                noise=0.001, sgpr_approx='VFE'):
         """
         Run Sparse GP Regression on the gene expression data.
         """
-        gene_groups, z_prior, sub_count = self.get_initialized_embeddings(n_genes=n_genes, qts_prior=qts_prior, clustering=False)
-        X = torch.cat([ts.T for ts in gene_groups.values()], dim=0) if isinstance(gene_groups, dict) else gene_groups
-        y = torch.tensor(sub_count, dtype=torch.float32) if not isinstance(sub_count, torch.Tensor) else sub_count
+        if X == None:
+            X, y = self.get_initialized_embeddings(n_genes=n_genes, qts_prior=qts_prior, clustering=False)
+        X = X if X.shape[0] == y.shape[1] else X.T  # to ensure X transposed shape matches y
         kernel = gp.kernels.RBF(input_dim=X.shape[1], lengthscale=torch.ones(X.shape[1]))  # kernel input_dim is the number of features in X, which is the number of genes
         coords = self.coords - self.coords.mean(dim=0)  # center the coordinates
         ttl_cnts = self.adata.obs['total_counts'].values
         ttl_cnts = torch.tensor(ttl_cnts, dtype=torch.float32)
         
-        gplvm = SparseGPRegression(X, y, kernel, 
+        self.model = SparseGPRegression(X, y, kernel, 
                                 coords=coords, in_tiss_mask=self.in_tiss_mask, ttl_cnts=ttl_cnts,
                                 noise=torch.tensor(noise), jitter=1e-5, approx=sgpr_approx, 
                                 )
+        return self.model
+    
+    def define_PID(self, X=None, y=None, n_genes=1000, qts_prior=0.8, **kwargs):
+        """
+        Run Sparse GP Regression on the gene expression data.
+        """
+        if X == None:
+            self.get_initialized_embeddings(n_genes=n_genes, qts_prior=qts_prior, clustering=False)
+            X = self.res_count
+            y = self.sub_count
+        X = X if X.shape[0] == y.shape[0] else X.T  # to ensure X has same shape as y
+        neighbor_graph = self.spatial_con.toarray() if issparse(self.spatial_con) else self.spatial_con
+        self.spatial_con = torch.tensor(neighbor_graph, dtype=torch.float32)
+        self.ttl_cnts = self.adata.obs['total_counts'].values
+        self.ttl_cnts = torch.tensor(self.ttl_cnts, dtype=torch.float32)
+        # Initialize model
+        default_params = {
+            'n_spots': X.shape[0],
+            'n_genes': X.shape[1],
+            'coords': self.coords,
+            
+            'D_constraint': "positive",  # or "bounded" based on your needs
+            'initial_counts_guess': X,
+            'total_counts': self.ttl_cnts,
+            'alpha': 0.8,
+            'beta': 0.2,
+        }
+        # Update default parameters with any additional kwargs
+        default_params.update(kwargs)
         
-        from pyro.infer import SVI, TraceMeanField_ELBO
-        from pyro.optim import ClippedAdam
-
-        def train_model(model, num_epochs=1000, lr=0.01, patience=10, min_delta=1.0):
-            # Setup optimizer and ELBO
-            optimizer = ClippedAdam({"lr": lr})
-            elbo = TraceMeanField_ELBO()
-            svi = SVI(model.model, model.guide, optimizer, loss=elbo)
-
-            # Early stopping monitor
-            early_stopper = EarlyStopping(patience=patience, min_delta=min_delta, mode='min')
-
-            for epoch in range(num_epochs):
-                loss = svi.step()
-                print(f"Epoch {epoch}, ELBO loss: {loss:.4f}")
-
-                if early_stopper(loss):
-                    print("Early stopping triggered.")
-                    break
-
-            return model
-
-        trained_model = train_model(gplvm, num_epochs=train_steps, lr=0.01, patience=10, min_delta=0.5)
-
-        losses = gp.util.train(gplvm, num_steps=train_steps)
+        self.model = PhysicsInformedDiffusionModel(
+            **default_params
+        )
+        return self.model
         
-        # let's plot the loss curve after 4000 steps of training
-        plt.figure(figsize=(10, 5))
-        plt.title("Sparse GP Regression Loss Curve")
-        plt.xlabel("Training Steps")
-        plt.ylabel("Loss")
-        plt.grid()
-        plt.plot(losses, label='Loss')
-        plt.legend()
-        plt.savefig(figname)
+    def train(self, learning_rate=0.01, n_epochs=1000):
+        """Train the model using SVI"""
+        pyro.clear_param_store()
+        
+        # Initialize optimizer with learning rate scheduling
+        scheduler = pyro.optim.ExponentialLR({
+            'optimizer': torch.optim.Adam,
+            'optim_args': {'lr': learning_rate},
+            'gamma': 0.995
+        })
+        
+        # Setup SVI
+        svi = pyro.infer.SVI(
+            model = self.model.model,
+            guide = self.model.guide,
+            optim = scheduler,
+            loss = pyro.infer.Trace_ELBO()
+        )
+        
+        # Training loop
+        losses = []
+        best_loss = float('inf')
+        patience = 20
+        patience_counter = 0
+        
+        for step in range(n_epochs):
+            loss = svi.step(
+                self.sub_count,
+                self.in_tiss_mask,
+                self.spatial_con
+            )
+            losses.append(loss)
+            
+            # Early stopping
+            if loss < best_loss:
+                best_loss = loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= patience:
+                print(f"Early stopping at step {step}")
+                break
+            
+            # Print progress
+            if step % 20 == 0:
+                print(f"Step {step}: Loss = {loss:.4f}")
+        
+        return losses
+    
+    def save(self, path: str):
+        """Save the trained model parameters"""
+        pyro.get_param_store().save(f'{path}/model.pt')
+        print(f"Model parameters saved to {path}/model.pt")
+        
+        self.adata.uns['undiff'] = {
+            'gene_selected': self.gene_selected,
+            'res_count': self.res_count,
+            'invalid_qts': self.invalid_qts,
+        }
+        self.adata.write_h5ad(f'{path}/adata.h5ad')
+        
+        
+    @staticmethod
+    def load(path: str):
+        """Load a trained model from saved parameters"""
+        # Load model parameters
+        pyro.get_param_store().load(f'{path}/model.pt')
+        
+        adata = sc.read_h5ad(f'{path}/adata.h5ad')
+        # Reconstruct the undiff model
+        restorer = undiff(adata)
+        restorer.gene_selected = adata.uns['undiff']['gene_selected']
+        restorer.sub_count = adata[:, restorer.gene_selected].X.toarray() if issparse(adata[:, restorer.gene_selected].X) else adata[:, restorer.gene_selected].X
+        restorer.sub_count = torch.tensor(restorer.sub_count, dtype=torch.float32)
+        restorer.res_count = adata.uns['undiff']['res_count']
+        restorer.invalid_qts = adata.uns['undiff']['invalid_qts']
+        restorer.model = PhysicsInformedDiffusionModel(
+            n_spots=restorer.res_count.shape[0],
+            n_genes=restorer.res_count.shape[1],
+            coords=restorer.coords,
+            dt=0.1,
+            D_init=0.1,
+            D_constraint="positive",
+            initial_counts_guess=restorer.res_count,
+            alpha=0.2,
+            beta=0.2,
+        )
+        return restorer
+    
+    def get_restored_counts(self, num_samples: int = 100) -> np.ndarray:
+        """Get restored counts by sampling from posterior"""
+        restored_samples = []
+        
+        # Sample from posterior
+        for _ in range(num_samples):
+            with torch.no_grad():
+                restored = self.model.guide(
+                    self.sub_count,
+                    self.in_tiss_mask,
+                    self.spatial_con
+                )
+                restored_samples.append(restored)
+        
+        # Average samples
+        restored_mean = torch.stack(restored_samples).mean(0)
+        
+        return restored_mean.numpy()
+    
+    def restore_adata(self, copy: bool = False):
+        """Create new AnnData object with restored counts"""
+        if copy:
+            new_adata = self.adata.copy()
+        else:
+            new_adata = self.adata
+            
+        restored_counts = self.get_restored_counts()
+        if restored_counts.shape[1] == len(self.adata.n_vars):
+            new_adata.layers['restored'] = restored_counts
+        else:
+            new_adata.uns['restored'] = restored_counts
+        
+        return new_adata if copy else None
 
-        # return the model 
-        return gplvm, losses

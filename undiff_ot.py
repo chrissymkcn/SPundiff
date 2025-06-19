@@ -1,32 +1,18 @@
-# This is a project to correct for mRNA diffusion in spatial transcriptomic data. The background is that mRNA molecules diffuse during 
-# sequencing (according to some physical law, assumed to be physical diffusion with potential obstruction by cellular environment) 
-# and I am essentially trying to impute the undiffused state from the final concentration field. 
-# The main idea is to use the spatial coordinates of the spots and the expression values of the genes to learn a mapping from the observed.
-# OT framework is used to model/simulate the reverse diffusion process. To allow adaptation to different genes, I compute a global ot plan first
-# and then adapt it to each gene using a gene-specific diffusion coefficient.
-
-
-import squidpy as sq
-from scipy.cluster.hierarchy import linkage, leaves_list
-from concurrent.futures import ThreadPoolExecutor
+from .base import base
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+import scanpy as sc
+import ot
+import kornia.losses as kornia_losses
+import kornia.filters as kornia_filters
+import time
+from scipy.sparse import issparse
 import kornia.losses as kornia_losses
 import kornia.filters as kornia_filters
 import torch.optim as optim
-import torch
-import torch.nn.functional as F
-from scipy.sparse import issparse
-import numpy as np  # always need it
-import ot  # ot
-import pandas as pd
-import scanpy as sc
 import time
-from sklearn.metrics.pairwise import cosine_similarity
-# import torch.utils.checkpoint as checkpoint
-# from sklearn.metrics import silhouette_score
-# from scipy.optimize import minimize
-# from skimage.metrics import structural_similarity as ssim
-# from joblib import Parallel, delayed
-from scipy.sparse import isspmatrix
 
 class DynamicLossBalancer:
     def __init__(self, num_losses=2):
@@ -41,8 +27,7 @@ class DynamicLossBalancer:
         weighted_losses = precision * losses + self.log_vars
         return torch.sum(weighted_losses)
 
-
-class undiff():
+class undiff_ot(base):
     DEFAULT_OT_PARAMS = {
         # OT parameters
         'mass': 1,
@@ -66,206 +51,16 @@ class undiff():
         'train_n_epochs': 10,
         'train_tol': 1e-9,
     }
-    
-    def __init__(self, adata, n_jobs=1, metric='euclidean', 
-            optimizer='adam', optim_params=None):
-        self.adata = adata.copy()
-        self.var_names = adata.var_names
-        self.sub_count = None
-        self.res_count = None
-        self.raw_count = adata.X.copy()  # keep a sparse copy of the count
-        sq.gr.spatial_neighbors(adata, n_neighs=15)
-        self.spatial_con = adata.obsp['spatial_connectivities']
-        self.spatial_dist = adata.obsp['spatial_distances']
-        # self.coords = self.spatial_to_grid()
-        # self.coords = self.coords - self.coords.min(axis=0)
-        self.img_key = 'hires'
-        self.lib_id = list(self.adata.uns['spatial'].keys())[0]
-        self.y1_max, self.y2_max = self.adata.uns['spatial'][self.lib_id]['images'][self.img_key].shape[:2]
-        self.coords = self.scale_spatial()
-        self.in_tiss_mask = torch.tensor(adata.obs['in_tissue'].values, dtype=torch.float32, requires_grad=False)
-        self.gene_selected = []
-        self.gene_indices = None
-        self.coord_cost = self.compute_distance_cost(metric=metric)
-        self.scaled_cost = None
-        self.original_moranI = None  # do not define this here as user may want to use different genes
-        self.original_image_align_score = None
+    def __init__(self, adata, metric='euclidean',
+                    optimizer='adam', optim_params=None):
+        super().__init__(adata, metric=metric, 
+                         optimizer=optimizer, optim_params=optim_params)
         # Initialize
-        self.n_jobs = n_jobs
-        self.last_z = None
         self.objective_values = []  # Global list to store objective values
         self.optimizer = optimizer
-        # parameters
-        self.cost_weight_s = None
-        self.cost_weight_t = None
-        self.invalid_qts = None
-        self.regs = None
-        self.global_reg = None
-        self.params = undiff.DEFAULT_OT_PARAMS
-        self.params.update(optim_params) if optim_params is not None else None
-        self.alpha_prev = None
-        self.beta_prev = None
-        torch.backends.cudnn.benchmark = True  # Enable cudnn auto-tuner
-        torch.backends.cudnn.enabled = True
-
-    def interpolate_grid(self):
-        coords = self.adata.obsm['spatial'].copy()
-
-        # Calculate optimal grid size
-        n_bins = int(np.ceil(np.sqrt(self.adata.n_obs)))
-        while True:
-            x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
-            y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
-            
-            bin_width = (x_max - x_min) / n_bins
-            bin_height = (y_max - y_min) / n_bins
-            
-            # Calculate grid indices
-            grid_x = np.floor((coords[:, 0] - x_min) / bin_width)
-            grid_y = np.floor((coords[:, 1] - y_min) / bin_height)
-            
-            # Check for uniqueness
-            if len(set(zip(grid_x, grid_y))) == self.adata.n_obs:
-                break
-            n_bins += 1
-        
-        # Calculate normalized coordinates
-        min_x_diff = np.diff(np.unique(grid_x)).min()
-        min_y_diff = np.diff(np.unique(grid_y)).min()
-        
-        # Handle case where all x or y coordinates are the same
-        min_x_diff = min_x_diff if not np.isnan(min_x_diff) else 1
-        min_y_diff = min_y_diff if not np.isnan(min_y_diff) else 1
-        
-        x_u = grid_x / min_x_diff
-        y_u = grid_y / min_y_diff
-        
-        # Ensure integer coordinates after normalization
-        x_u = np.round(x_u - x_u.min()).astype(int)
-        y_u = np.round(y_u - y_u.min()).astype(int)
-        
-        # Final uniqueness check
-        assert len(set(zip(x_u, y_u))) == self.adata.n_obs, "Duplicate coordinates after normalization"
-        
-        return np.column_stack([grid_x, grid_y])
-
-    def calc_diff(self, df):
-        diffs_x = []
-        diffs_y = []
-        for i in df['y'].unique():
-            diffs = df[df['y'] == i]['x'].sort_values().diff().unique()
-            diffs_x += [x for x in diffs if not np.isnan(x) and x not in diffs_x and x > 0]
-        for i in df['x'].unique():
-            diffs = df[df['x'] == i]['y'].sort_values().diff().unique()
-            diffs_y += [y for y in diffs if not np.isnan(y) and y not in diffs_y and y > 0]
-        print(f"diffs_x: {diffs_x}")
-        print(f"diffs_y: {diffs_y}")
-        return diffs_x, diffs_y    
-
-    def calc_grid(self, df, cols):
-        diffs_x, diffs_y = self.calc_diff(df)
-        for col in cols:
-            other_col = 'y' if col == 'x' else 'x'
-            diffs = diffs_y if col == 'x' else diffs_x
-            for i in df[col].sort_values().unique():
-                coords = df[df[col] == i].sort_values(by=other_col)
-                for j in range(coords.shape[0]):
-                    difflast = coords.iloc[j][other_col] - coords.iloc[j-1][other_col]
-                    if difflast > np.min(diffs):
-                        coords.iloc[j][other_col] = coords.iloc[j-1][other_col] + np.min(diffs)
-                df.loc[coords.index, other_col] = coords[other_col]
-        return df
-
-    # write above logic in a function, as concise as possible, no plotting
-    def spatial_to_grid(self):
-        df = pd.DataFrame(self.interpolate_grid(), columns=['x', 'y'])
-        xy_order = self.calc_grid(df.copy(), ['x', 'y'])
-        yx_order = self.calc_grid(df.copy(), ['y', 'x'])
-        # print(f"xy_order: {xy_order.iloc[:10,:]}, yx_order: {yx_order.iloc[:10,:]}")
-        self.adata.obsm['grid_spatial_xy'] = np.column_stack([xy_order['x'], xy_order['y']])
-        self.adata.obsm['grid_spatial_yx'] = np.column_stack([yx_order['x'], yx_order['y']])
-        for key_added in ['grid_spatial_xy', 'grid_spatial_yx', 'spatial']:
-            sq.gr.spatial_neighbors(self.adata, spatial_key=key_added, n_neighs=6, key_added=f'{key_added}')
-        # calculate similarity between the orinigal adjacency matrix (from 'spatial') and adj matrices from the two grid_spatial embeddings
-        spatial_adj = self.adata.obsp['spatial_distances']
-        xy_adj = self.adata.obsp['grid_spatial_xy_distances']
-        yx_adj = self.adata.obsp['grid_spatial_yx_distances']
-        xy_diff = cosine_similarity(spatial_adj, xy_adj).mean()
-        yx_diff = cosine_similarity(spatial_adj, yx_adj).mean()
-        # print(f"xy_diff: {xy_diff}, yx_diff: {yx_diff}")    
-        self.adata.obsm['grid_spatial'] = self.adata.obsm['grid_spatial_xy'].copy() if xy_diff > yx_diff else self.adata.obsm['grid_spatial_yx'].copy()
-        for key in ['grid_spatial_xy', 'grid_spatial_yx']:
-            del self.adata.obsm[key], self.adata.obsp[f'{key}_distances'], self.adata.obsp[f'{key}_connectivities'], self.adata.uns[f'{key}_neighbors']        
-        return self.adata.obsm['grid_spatial'].copy()
-
-    def get_coordinates(self, grid: bool = False):
-        """
-        Get spatial coordinates from the adata object.
-        If grid is True, return the grid coordinates.
-        Otherwise, return the original spatial coordinates.
-        """
-        if grid:
-            if 'grid_spatial' not in self.adata.obsm:    
-                coords = self.spatial_to_grid()
-            else:
-                coords = self.adata.obsm['grid_spatial'].copy()
-            coords = torch.tensor(coords, dtype=torch.float32)
-        else:
-            coords = self.coords if isinstance(self.coords, torch.Tensor) else torch.tensor(self.coords, dtype=torch.float32)
-        coords = torch.round(coords).to(torch.float32)
-        return coords
-
-    def grid_embedding(self, values, grid=False):
-        grid_coords = self.get_coordinates(grid=grid)
-        x_max, y_max = grid_coords[:, 0].max(), grid_coords[:, 1].max()
-        twod_grid = np.zeros((int(y_max) + 1, int(x_max) + 1))
-        for i in range(grid_coords.shape[0]):
-            x, y = int(grid_coords[i, 0]), int(grid_coords[i, 1])
-            twod_grid[y, x] = values[i]
-        return twod_grid
-
-    def orig_coord_embedding(self, values):
-        """
-        Hyper-optimized square drawing with:
-        - No extra columns
-        - No Python loops
-        - Full gradient flow
-        - Minimal memory usage
-        """
-        image_shape = (self.y1_max, self.y2_max)
-        coords = self.get_coordinates(grid=False)
-        grid_coords = torch.round(coords).long()
-        
-        # Calculate square parameters
-        scale_factor = self.adata.uns['spatial'][self.lib_id]['scalefactors'][f'tissue_{self.img_key}_scalef']
-        radius = int(100 * scale_factor)
-        size = 2 * radius + 1
-        
-        # Create base indices for a square [-radius, radius]
-        y_idx = torch.arange(-radius, radius+1, device=values.device)
-        x_idx = torch.arange(-radius, radius+1, device=values.device)
-        yy, xx = torch.meshgrid(y_idx, x_idx, indexing='ij')
-        
-        # Calculate all possible positions (vectorized)
-        all_y = (grid_coords[:, 0].unsqueeze(1).unsqueeze(2) + yy.unsqueeze(0))
-        all_x = (grid_coords[:, 1].unsqueeze(1).unsqueeze(2) + xx.unsqueeze(0))
-        
-        # Flatten and filter valid positions
-        flat_y = all_y.flatten()
-        flat_x = all_x.flatten()
-        valid_mask = (flat_y >= 0) & (flat_y < image_shape[0]) & \
-                    (flat_x >= 0) & (flat_x < image_shape[1])
-        
-        # Prepare values (repeated for each square pixel)
-        repeated_values = values.repeat_interleave(size*size)[valid_mask]
-        
-        # Calculate linear indices for valid positions
-        linear_indices = flat_x[valid_mask] * image_shape[1] + flat_y[valid_mask]
-        
-        # Scatter-add using valid indices only
-        grid = torch.zeros(image_shape, dtype=values.dtype, device=values.device)
-        grid.view(-1).scatter_add_(0, linear_indices, repeated_values)
-        return grid
+        self.params = self.DEFAULT_OT_PARAMS.copy()
+        if optim_params is not None:
+            self.params.update(optim_params)
     
     def calc_loss(self):
         # loss from image alignment score, higher is better
@@ -338,7 +133,6 @@ class undiff():
             torch.cuda.empty_cache()
         self.res_count = torch.stack(res, dim=1)            
 
-
     def objective(self, params):
         """
         Objective function with gradient checkpointing to reduce memory usage.
@@ -348,7 +142,7 @@ class undiff():
         global_reg = params['global_reg']
         
         # Process genes with checkpointing
-        self.cost_matrix_calculation(cost_weight_s, cost_weight_t) # for computing scaled cost matrix
+        self.scaled_cost_matrix_calculation(cost_weight_s, cost_weight_t) # for computing scaled cost matrix
         self.compute_shared_OT(global_reg) # for updating warmstart
         self.compute_res_count(params)
         self.last_z = self.res_count.detach().clone()
@@ -366,56 +160,10 @@ class undiff():
 
         return torch.stack(list(loss_d.values()))
 
-    def impute_qt_vectorized(self, n_steps=10, max_qt=0.3):
-        """
-        Vectorized implementation that processes all genes simultaneously.
-        Less memory-efficient but maintains full differentiability.
-        """
-        gene_indices = self.gene_indices
-        # X = self.sub_count.detach().clone()
-        X = self.sub_count.detach().clone() * self.in_tiss_mask.unsqueeze(1)
-        # print("X shape:", X.shape)
-        quantiles = torch.linspace(0.05, max_qt, steps=n_steps)
-        print("Quantiles:", quantiles)
-        best_cutoffs = torch.zeros(len(gene_indices))
-        best_qts = torch.zeros(len(gene_indices))
-        best_morans = torch.full((len(gene_indices),), -float('inf'))  # make sure to pass in a tuple for shape 
-        
-        for qt in quantiles:
-            print("Processing quantile:", qt)
-            cutoffs = torch.quantile(X, qt, dim=0)
-            masks = X > cutoffs.unsqueeze(0)
-            # print("Masks shape:", masks.shape)
-            
-            # Compute Moran's I for each gene
-            for i, mask in enumerate(masks.T):
-                valid_spots = mask.sum()
-                if valid_spots < 10:
-                    continue
-                    
-                z = X[mask, i]
-                coords = self.coords[mask]
-                W = 1 / (1 + torch.cdist(coords, coords, p=2))
-                
-                N = z.shape[0]
-                z_mean = z.mean()
-                z_centered = z - z_mean
-                S0 = W.sum()
-                Wz = torch.matmul(W, z_centered)
-                
-                current_moran = (N / S0) * (torch.sum(z_centered * Wz) / (torch.sum(z_centered ** 2) + 1e-8))
-                
-                if current_moran > best_morans[i]:
-                    best_morans[i] = current_moran
-                    best_qts[i] = qt
-                    best_cutoffs[i] = cutoffs[i]
-        best_cutoffs = torch.tensor(best_cutoffs.detach().numpy(), requires_grad=True)
-        return best_cutoffs
-    
     def set_states(self, qts_prior):
+        super(unddiff, self).set_states(qts_prior=qts_prior)
         self.objective_values = []
         self.last_z = None
-        n_genes = len(self.gene_selected)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.cost_weight_s = torch.ones(
                 self.coords.shape[0], 
@@ -429,28 +177,9 @@ class undiff():
                 requires_grad=True,
                 device=device
             )
-        self.invalid_qts = self.impute_qt_vectorized(max_qt=qts_prior)  # Shape [N], the quantile cutoff is an estimation such that expression above it is highly likely to be the source
-        self.invalid_qts.to(device)
-        self.regs = torch.tensor([6.0] * n_genes, requires_grad=True, dtype=torch.float32, device=device)
+        self.regs = torch.tensor([6.0] * self.sub_count.shape[1], requires_grad=True, dtype=torch.float32, device=device)
         self.global_reg = torch.tensor(1.0, requires_grad=True, dtype=torch.float32, device=device)
-        self.alpha_prev = None
-        self.beta_prev = None
         
-    def prep_genes_params(self, add_genes=[], first_n_genes=None):
-        raw_count = self.raw_count.toarray() if issparse(self.raw_count) else self.raw_count
-        self.gene_selected = self.gene_selection()
-        first_n_genes = first_n_genes if first_n_genes is not None else len(self.gene_selected)
-        self.gene_selected = self.gene_selected[:first_n_genes] + [g for g in add_genes if g not in self.gene_selected]
-        self.gene_selected = np.array(self.gene_selected)
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.gene_indices = torch.tensor(
-            [self.adata.var_names.get_loc(g) for g in self.gene_selected],
-            dtype=torch.long, device=device
-        )  # gene indices indicate gene indices in original data
-        self.sub_count = torch.tensor(raw_count[:, self.gene_indices], dtype=torch.float32, device=device)
-        self.var_ttcnt = torch.tensor(self.adata.var.loc[self.gene_selected, 'total_counts'].values, dtype=torch.float32, device=device)
-        torch.autograd.set_detect_anomaly(True)
-
     def optimization(self, first_n_genes=None, add_genes=[], qts_prior=0.4, optim_params=None, optim_name=None):
         """
         Optimize the objective function using the given optimizer.
@@ -539,42 +268,6 @@ class undiff():
         }
         return res
 
-    def prep(self, invalid_qts):
-        """
-        Prepares the input data for the OT computation.
-        Including tissue mask applying to in_tiss, soft thresholding and normalization.
-        """
-        params = self.params 
-        X_g = self.sub_count.detach().clone()
-        ttcnt = self.sub_count.sum(dim=0)
-        out_tiss = X_g.clone()
-        in_tiss = X_g.clone()
-        in_tiss_filt, out_tiss_filt = self.soft_thresholding(in_tiss, out_tiss, invalid_qts)            
-        out_tiss_sum, in_tiss_sum = out_tiss_filt.sum(dim=0), in_tiss_filt.sum(dim=0)
-        s = out_tiss_sum + in_tiss_sum
-        sum_scale = s / ttcnt
-        out_tiss_filt = out_tiss_filt / sum_scale
-        in_tiss_filt = in_tiss_filt / sum_scale
-        out_tiss_sum, in_tiss_sum = out_tiss_filt.sum(dim=0), in_tiss_filt.sum(dim=0)
-        if params['to_one']:
-            out_tiss_filt = out_tiss_filt / out_tiss_sum
-            in_tiss_filt = in_tiss_filt / in_tiss_sum
-        
-        return out_tiss_filt, in_tiss_filt, out_tiss_sum, in_tiss_sum
-        
-    def compute_distance_cost(self, metric='euclidean'):
-        coords = self.coords
-        if metric == 'euclidean':
-            cost = torch.cdist(coords, coords, p=2)
-        elif metric == 'manhattan':
-            cost = torch.cdist(coords, coords, p=1)
-        elif metric == 'chebyshev':
-            cost = torch.cdist(coords, coords, p=float('inf'))
-        else:
-            raise ValueError('Metric not recognized.')
-        cost.requires_grad = True
-        return cost
-
     def gene_sim_scale_cost(self, base_distance, diffusion_coefficients):
         """
         base_distance: (nsource, ntarget) basic distance matrix
@@ -600,31 +293,6 @@ class undiff():
         scaled = ((data - cost_min) / (cost_max - cost_min)) * r + ttl_min
         return scaled
 
-    def scaling(self, C, scale=None):
-        scale = scale if scale is not None else self.params['scale_cost']
-        c_max = C.max(dim=1, keepdim=True)[0]
-        c_min = C.min(dim=1, keepdim=True)[0]
-        c_std = C.std(dim=1, keepdim=True)
-        c_mean = C.mean(dim=1, keepdim=True)
-        c_sum = C.sum(axis=1, keepdims=True)
-        if scale == 'by_max':
-            scaled_cost = C / c_max  # normalized by each row (source)
-        elif scale == 'by_minmax':
-            scaled_cost = (C - c_min) / (c_max - c_min)
-        elif scale == 'log':
-            scaled_cost = torch.log1p(C)
-        elif scale == 'by_sum':
-            scaled_cost = C / c_sum
-        elif scale == 'by_ttlcnt_range':
-            ttl_cnts = self.sub_count.sum(axis=1).detach().clone()
-            ttl_cnts = ttl_cnts / ttl_cnts.sum()
-            ttl_range = [ttl_cnts.min(), ttl_cnts.max()]
-            scaled_cost = self.scale_to_range(ttl_range, C)
-        else:
-            raise(ValueError)
-        return scaled_cost
-    
-    
     def ssim_loss(self, pred_img, target_img, window_size=11):
         return kornia_losses.ssim_loss(
             pred_img, 
@@ -728,46 +396,6 @@ class undiff():
         })
         
         return losses
-
-    def soft_thresholding(self, gene_expr_in, gene_expr_out, quantiles):
-        """向量化实现，同时处理所有 genes 的阈值滤波"""
-        # cutoffs = self.smooth_quantile_batch(gene_expr_in, quantiles)
-        cutoffs = quantiles
-        
-        # 2. 创建广播用掩码 [n_spots, 1]
-        in_tiss_mask_2d = self.in_tiss_mask.unsqueeze(1).bool()  # shape [n_spots, 1]
-        
-        # 3. 并行计算以下过滤条件（利用广播机制避免大矩阵）==================================
-        
-        # -- in_tiss_filt条件（梯度可导处理）--
-        # (a) 超过阈值的内组织 spots（保留原始值）
-        mask_high_expression = (gene_expr_in > cutoffs) & in_tiss_mask_2d  # shape [n_spots, n_genes]
-        
-        # (b) 低于阈值的内组织 spots（应用软衰减）
-        scaled_diff = (gene_expr_in - cutoffs) / (gene_expr_in.max(0)[0] - gene_expr_in.min(0)[0])
-        soft_mask = torch.sigmoid(100 * (scaled_diff - 0.5))  # 陡峭但能保持梯度的阈值过渡
-        
-        in_tiss_filt = torch.where(
-            mask_high_expression,
-            gene_expr_in,
-            gene_expr_in * soft_mask
-        )
-        
-        # -- out_tiss_filt条件（梯度可导处理）--
-        # (a) 内组织中低于阈值的部分
-        # (b) 全部外组织 spots
-        mask_out = (~mask_high_expression) | (~in_tiss_mask_2d)  # shape [n_spots, n_genes]
-        
-        # (c) 为数值稳定性添加ε
-        eps = 1e-20
-        out_tiss_filt = torch.where(
-            mask_out,
-            gene_expr_out,  # 这里使用原始输出的表达量（只读操作）
-            torch.tensor(eps, device=gene_expr_out.device)
-        )
-        
-        # 4. 保持梯度连接的数值稳定性
-        return torch.clamp(in_tiss_filt, min=eps), torch.clamp(out_tiss_filt, min=eps)
 
     def smooth_quantile_batch(self, x, q):
         """向量化的分位数计算 (行→基因方向)"""
@@ -956,7 +584,7 @@ class undiff():
             log=True
         )
 
-    def cost_matrix_calculation(self, cost_weight_s, cost_weight_t):
+    def scaled_cost_matrix_calculation(self, cost_weight_s, cost_weight_t):
         base_cost = self.coord_cost
         params = self.params
         diff_coeff = torch.outer(cost_weight_s, cost_weight_t)
@@ -985,42 +613,6 @@ class undiff():
         transported_in = to_target * out_tiss_sum + in_tiss_filt * in_tiss_sum    
         return transported_in.unsqueeze(1)  # Add a new dimension for broadcasting
 
-    def gene_selection(self, out_tiss_perc=0.8, min_count=100):
-        if 'highly_variable' not in self.adata.var.columns:
-            self.adata.var['MT'] = self.adata.var_names.str.startswith("MT-")
-            self.adata.var['mt'] = self.adata.var_names.str.startswith("mt-")
-            if any(self.adata.var['MT']) or any(self.adata.var['mt']):
-                self.adata.var['mt'] = self.adata.var['MT'] | self.adata.var['mt']
-                sc.pp.calculate_qc_metrics(self.adata, qc_vars=["mt"], inplace=True)
-            else:
-                sc.pp.calculate_qc_metrics(self.adata, inplace=True)
-            sc.pp.normalize_total(self.adata, target_sum=1e4)
-            sc.pp.log1p(self.adata)
-            sc.pp.highly_variable_genes(self.adata, flavor="seurat", n_top_genes=5000)
-        
-        out = self.adata[self.adata.obs['in_tissue']==0]
-        out.var['total_counts'] = out.X.toarray().sum(axis=0)
-        
-        for i in range(100, len(out.var_names), 20):
-            union_genes = out.var.sort_values('total_counts', ascending=False).index[:i].values
-            perc_out = out.var.loc[union_genes,'total_counts'].sum()/out.var['total_counts'].sum()
-            if perc_out > out_tiss_perc:
-                break
-        
-        all_hvgs = self.adata.var_names[self.adata.var['highly_variable']].values
-        union_genes = np.concatenate([union_genes, all_hvgs])
-        union_genes = np.unique(union_genes).tolist()
-        
-        # Remove mitochondrial and DEPRECATED genes
-        to_remove = ['MT-', 'mt-', 'DEPRECATED','Rik']
-        union_genes = [x for x in union_genes if not any(sub in x for sub in to_remove)]
-        union_genes = [x for x in union_genes if self.adata.var.loc[x, 'total_counts'] > min_count]
-        # rank genes by expression counts
-        union_genes = self.adata.var.loc[union_genes, 'total_counts'].sort_values(ascending=False).index.tolist()
-        # Sort genes by expression similarity
-        # union_genes = self.sort_genes_by_similarity(union_genes)        
-        return union_genes
-        
     def adata_processing(self):
         # check if the data is integer
         if self.adata.X.data.dtype in [np.int32, torch.int64, torch.uint32, torch.uint64, int]:
@@ -1031,20 +623,6 @@ class undiff():
         sc.pp.pca(self.adata)
         sc.pp.neighbors(self.adata, n_pcs=30, n_neighbors=30)
 
-    def scale_spatial(self, lib_id=None, coords=None):
-        if coords is None:
-            coords = self.adata.obsm['spatial']
-        lib_id = list(self.adata.uns['spatial'].keys())[0] if lib_id is None else lib_id
-        img_key = [k for k in self.adata.uns['spatial'][lib_id]['scalefactors'].keys() if 'hires' in k]
-        if len(img_key) > 0:
-            img_key = img_key[0]
-        else:
-            img_key = [k for k in self.adata.uns['spatial'][lib_id]['scalefactors'].keys() if 'lowres' in k][0]
-        scaled_spatial = coords * self.adata.uns['spatial'][lib_id]['scalefactors'][img_key]
-        scaled_spatial = np.round(scaled_spatial)
-        scaled_spatial = torch.tensor(scaled_spatial, dtype=torch.float32, requires_grad=False)
-        return scaled_spatial
-    
     def get_image_embedding(self, lib_id=None):
         lib_id = self.lib_id if lib_id is None else lib_id
         img = self.adata.uns['spatial'][lib_id]['images'][self.img_key]
@@ -1069,7 +647,6 @@ class undiff():
         z_field_normed = (z_field - z_field.min()) / (z_field.max() - z_field.min())
         return z_field_normed
         
-
     def eval_moranI(
         self,
         normalize_weights: bool = True,
@@ -1154,100 +731,3 @@ class undiff():
         adata_ot.X = self.res_count.detach().numpy()
         return adata_ot
     
-    def round_counts_to_integers(self, preserve_sum=True, return_copy=False):
-        """
-        Round corrected expression counts to integers.
-        
-        Parameters
-        ----------
-        preserve_sum : bool, default=True
-            If True, preserve the column-wise sums during rounding
-        return_copy : bool, default=False
-            If True, return a copy of the rounded counts without modifying self.res_count
-            
-        Returns
-        -------
-        rounded_counts : torch.Tensor
-            Rounded count matrix (returned only if return_copy=True)
-        """
-        if self.res_count is None:
-            raise ValueError("No corrected counts available. Run optimization first.")
-            
-        # Work with a copy to avoid modifying the original
-        rounded_counts = self.res_count.clone()
-        
-        if preserve_sum:
-            # Approach 1: Preserve column sums using largest remainder method
-            # Get original column sums
-            original_sums = rounded_counts.sum(dim=0)
-            
-            # Simple rounding
-            simple_rounded = torch.round(rounded_counts)
-            
-            # Calculate column sums after simple rounding
-            rounded_sums = simple_rounded.sum(dim=0)
-            
-            # Calculate deficit or excess for each column
-            count_diff = original_sums - rounded_sums
-            
-            for j in range(rounded_counts.shape[1]):
-                if count_diff[j] == 0:
-                    continue
-                    
-                # Get the fractional parts
-                frac_parts = rounded_counts[:, j] - simple_rounded[:, j]
-                
-                # We need to adjust based on deficit or excess
-                adjustment = int(count_diff[j].item())
-                
-                if adjustment > 0:  # Need to round up more values
-                    # Find cells with highest fractional parts that were rounded down
-                    rounded_down = (frac_parts > 0) & (frac_parts < 0.5)
-                    candidates = torch.where(rounded_down)[0]
-                    
-                    # If not enough candidates, also consider those that were rounded up
-                    if len(candidates) < adjustment:
-                        rounded_up = frac_parts >= 0.5
-                        more_candidates = torch.where(rounded_up)[0]
-                        candidates = torch.cat([candidates, more_candidates])
-                    
-                    # Sort by fractional part (descending)
-                    if len(candidates) > 0:
-                        sorted_indices = candidates[torch.argsort(-frac_parts[candidates])]
-                        # Adjust by rounding up the top candidates
-                        for i in range(min(adjustment, len(sorted_indices))):
-                            simple_rounded[sorted_indices[i], j] += 1
-                            
-                elif adjustment < 0:  # Need to round down more values
-                    # Find cells with lowest fractional parts that were rounded up
-                    rounded_up = frac_parts >= 0.5
-                    candidates = torch.where(rounded_up)[0]
-                    
-                    # If not enough candidates, also consider those that were rounded down
-                    if len(candidates) < abs(adjustment):
-                        rounded_down = frac_parts < 0.5
-                        more_candidates = torch.where(rounded_down)[0]
-                        candidates = torch.cat([candidates, more_candidates])
-                    
-                    # Sort by fractional part (ascending)
-                    if len(candidates) > 0:
-                        sorted_indices = candidates[torch.argsort(frac_parts[candidates])]
-                        # Adjust by rounding down the bottom candidates
-                        for i in range(min(abs(adjustment), len(sorted_indices))):
-                            simple_rounded[sorted_indices[i], j] -= 1
-            
-            rounded_counts = simple_rounded
-        else:
-            # Simple rounding without preserving sums
-            rounded_counts = torch.round(rounded_counts)
-        
-        # Ensure no negative values
-        rounded_counts = torch.clamp(rounded_counts, min=0)
-        
-        # Either return the copy or modify in-place
-        if return_copy:
-            return rounded_counts
-        else:
-            self.res_count = rounded_counts
-            print(f"Rounded counts stored in res_count. Original range: [{self.res_count.min():.2f}, {self.res_count.max():.2f}]")
-            return None

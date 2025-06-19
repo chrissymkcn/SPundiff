@@ -209,17 +209,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
         self.total_counts = total_counts.unsqueeze(-1) if total_counts.dim() == 1 else total_counts  # Ensure shape is [n_spots, 1]
         # self.total_counts = torch.log1p(self.total_counts)  # Log-transform to stabilize training
         self.in_tiss_mask = in_tiss_mask if in_tiss_mask is not None else torch.ones(n_spots, dtype=torch.bool, device=coords.device)
-        self.D = D_out * (1 - in_tiss_mask) + D_in * in_tiss_mask
-        self.D = pyro.param(
-            "D",
-            self.D,
-            constraint=constraints.nonnegative
-        )
-        self.gene_specific_D = pyro.param(
-            "gene_specific_D",
-            torch.ones(n_genes, device=coords.device),
-            constraint=constraints.nonnegative
-        )
+        
         if initial_counts_guess is not None:
             self.initial_counts_guess = initial_counts_guess
             self.initial_counts_guess = torch.log1p(self.initial_counts_guess)  # Log-transform to stabilize training
@@ -228,23 +218,25 @@ class PhysicsInformedDiffusionModel(nn.Module):
                 
         # Add RBF-FD specific initialization
         self.neighbors = neighbors
-        self.compute_laplacian()
+        self.D = D_out * (1 - in_tiss_mask) + D_in * in_tiss_mask
+
 
     def compute_laplacian(self):
-        if not hasattr(self, 'laplacian'):
-            self.neighbors.fill_diagonal_(0)
-            degree = torch.diag(self.neighbors.sum(dim=1))
-            laplacian = degree - self.neighbors
-            alpha_diag = torch.diag(self.D)  # Diffusion coefficients as diagonal matrix to scale Laplacian 
-            scaled_laplacian = alpha_diag @ laplacian
-            self.laplacian = scaled_laplacian
+        self.neighbors.fill_diagonal_(0)
+        degree = torch.diag(self.neighbors.sum(dim=1))
+        laplacian = degree - self.neighbors
+        D = pyro.param('D')
+        alpha_diag = torch.diag(D)  # Pyro param
+        return alpha_diag @ laplacian  
 
-    def forward_diffusion(self, heat_init, steps=10):
-        heat = heat_init.clone()
-        total_heat = heat.sum(dim=0, keepdim=True)  # [1, n_genes]
+    
+    def forward_diffusion(self, heat, steps=10):
+        laplacian = self.compute_laplacian()  # Recompute each time
+        total_heat = heat.sum(dim=0, keepdim=True)
+        gene_specific_D = pyro.param("gene_specific_D")
         for _ in range(steps):
-            laplacian_update = self.laplacian @ heat
-            laplacian_update = laplacian_update * self.gene_specific_D 
+            laplacian_update = laplacian @ heat
+            laplacian_update = laplacian_update * gene_specific_D  # Pyro param
             heat = heat - laplacian_update
             heat = torch.clamp(heat, min=0.0)
         heat = (heat / heat.sum(dim=0, keepdim=True)) * total_heat
@@ -374,8 +366,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
         # 4. Check diffusion process
         print("\nChecking diffusion process:")
         # Debug Laplacian computation
-        self.compute_laplacian()
-        L = self.laplacian
+        L = self.compute_laplacian()
         self.debug_tensor("Laplacian", L.to_dense() if L.is_sparse else L)
 
         # Forward diffusion with intermediate checks
@@ -428,6 +419,17 @@ class PhysicsInformedDiffusionModel(nn.Module):
             in_tiss_mask: Binary mask for tissue locations [n_spots]
             neighbors: Spatial neighborhood matrix [n_spots, n_spots]
         """
+        D = pyro.param(
+            "D",
+            self.D,
+            constraint=constraints.nonnegative
+        )
+        gene_specific_D = pyro.param(
+            "gene_specific_D",
+            torch.ones(self.n_genes),
+            constraint=constraints.nonnegative
+        )
+        
         # Prior for original counts
         original_counts_loc = pyro.param(
             "original_counts_loc",
@@ -448,12 +450,11 @@ class PhysicsInformedDiffusionModel(nn.Module):
         
         # Physics-based diffusion
         diffused_counts = self.forward_diffusion(original_counts, steps=steps)  # [n_spots, n_genes]
-
         # Likelihood incorporating:
         # 1. Observation model
         # 2. Tissue mask constraint
         # 3. Spatial regularization
-        
+
         # 1. Observation likelihood
         total_counts = self.total_counts
         probs = diffused_counts / total_counts
@@ -477,12 +478,12 @@ class PhysicsInformedDiffusionModel(nn.Module):
         )
         
         # Spatial regularization using neighbor structure to encourage smoothness
-        spatial_diff = torch.sum(
-            self.neighbors.unsqueeze(2) * 
-            (diffused_counts.unsqueeze(1) - diffused_counts.unsqueeze(0))**2
-        )
-        spatial_factor = -self.beta * spatial_diff
-        pyro.factor("spatial_regularization", spatial_factor)
+        # spatial_diff = torch.sum(
+        #     self.neighbors.unsqueeze(2) * 
+        #     (diffused_counts.unsqueeze(1) - diffused_counts.unsqueeze(0))**2
+        # )
+        # spatial_factor = -self.beta * spatial_diff
+        # pyro.factor("spatial_regularization", spatial_factor)
         
         return original_counts
 

@@ -254,10 +254,10 @@ class undiff(base):
             'coords': self.coords,
             'D_out': 0.1,  # Initial diffusion coefficient
             'D_in': 0.02,
-            'initial_counts_guess': X,
-            'total_counts': self.ttl_cnts,
+            'initial_counts_guess': X.detach(),
+            'total_counts': self.ttl_cnts.detach(),
             'neighbors': self.spatial_con,
-            'in_tiss_mask': self.in_tiss_mask,
+            'in_tiss_mask': self.in_tiss_mask.detach(),
             'alpha': 0.8,
             'beta': 0.2,
         }
@@ -296,7 +296,7 @@ class undiff(base):
         
         for step in range(n_epochs):
             loss = svi.step(
-                self.sub_count,
+                self.sub_count.detach(),
                 diffusion_steps,
             )
             losses.append(loss)
@@ -325,8 +325,8 @@ class undiff(base):
         
         self.adata.uns['undiff'] = {
             'gene_selected': self.gene_selected,
-            'res_count': self.res_count,
-            'invalid_qts': self.invalid_qts,
+            'res_count': self.res_count.detach().cpu().numpy(),
+            'invalid_qts': self.invalid_qts.detach().cpu().numpy(),
         }
         self.adata.write_h5ad(f'{path}/adata.h5ad')
         

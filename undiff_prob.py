@@ -115,9 +115,9 @@ class undiff(base):
             # 'pca': pca,
         }
     
-    def run_initialization(self, qts_prior=0.8, n_genes=None, add_genes=[]):
+    def run_initialization(self, qts_prior=0.8, derivative_threshold=0.02, n_genes=None, add_genes=[]):
         self.prep_genes_params(add_genes=add_genes, first_n_genes=n_genes)
-        self.set_states(qts_prior=qts_prior)
+        self.set_states(qts_prior=qts_prior, derivative_threshold=derivative_threshold)
         # self.compute_shared_OT(self.global_reg) # for updating warmstart
         self.compute_res_count({
             'invalid_qts': self.invalid_qts,
@@ -186,8 +186,8 @@ class undiff(base):
         self.res_count = torch.stack(res, dim=1)
         self.round_counts_to_integers()
         
-    def get_initialized_embeddings(self, n_genes=100, qts_prior=0.8, clustering=False):
-        self.run_initialization(n_genes=n_genes, qts_prior=qts_prior)
+    def get_initialized_embeddings(self, n_genes=100, qts_prior=0.8, derivative_threshold=0.02, clustering=False):
+        self.run_initialization(n_genes=n_genes, qts_prior=qts_prior, derivative_threshold=derivative_threshold,)
         if clustering:
             res = undiff.auto_cluster(self.res_count.detach().cpu().numpy().T, starting_clusters=3, max_clusters=None)  # pass in transposed res_count to have genes as samples
             self.gene_clusters = {self.gene_selected[i]: lab for i,lab in enumerate(res['cluster_labels'])}
@@ -269,7 +269,7 @@ class undiff(base):
         )
         return self.model
         
-    def train(self, learning_rate=0.01, n_epochs=1000):
+    def train(self, diffusion_steps=6, learning_rate=0.01, n_epochs=1000):
         """Train the model using SVI"""
         pyro.clear_param_store()
         
@@ -297,6 +297,7 @@ class undiff(base):
         for step in range(n_epochs):
             loss = svi.step(
                 self.sub_count,
+                diffusion_steps,
             )
             losses.append(loss)
             

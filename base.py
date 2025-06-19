@@ -1,3 +1,5 @@
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter, find_peaks
 from kneed import KneeLocator
 from diffusion_sim import coords_to_filled_grid, calculate_domain_parameters
 import squidpy as sq
@@ -213,82 +215,132 @@ class base():
             raise(ValueError)
         return scaled_cost
 
-    def impute_qt_vectorized(self, n_steps=20, max_qt=1.0):
+    def impute_qt_vectorized(self, n_steps=20, max_qt=1.0, window_length=5, polyorder=2, derivative_threshold=0.03):
         """
         Vectorized implementation that processes all genes simultaneously.
-        Records all Moran's I values and selects quantile at elbow point.
-        
+        Applies Savitzky-Golay smoothing to Moran's I curves and selects turning point quantile.
+
         Returns:
             best_cutoffs: Tensor of optimal cutoffs for each gene
         """
         gene_indices = self.gene_indices
         X = self.sub_count.detach().clone() * self.in_tiss_mask.unsqueeze(1)
         quantiles = torch.linspace(0.05, max_qt, steps=n_steps, dtype=X.dtype)
-        quantiles = torch.round(quantiles, decimals=2)  # Round to avoid floating point issues
-        # Initialize storage
+        quantiles = torch.round(quantiles, decimals=2)
+
         all_morans = {qt.item(): [float('nan')] * len(gene_indices) for qt in quantiles}
         best_cutoffs = torch.zeros(len(gene_indices))
         best_qts = torch.zeros(len(gene_indices))
-        # Compute Moran's I for each quantile
-        for qt_idx, qt in enumerate(quantiles):
+
+        for qt in quantiles:
             cutoffs = torch.quantile(X, qt, dim=0)
             masks = X > cutoffs.unsqueeze(0)
             for gene_idx in range(len(gene_indices)):
                 mask = masks[:, gene_idx]
-                valid_spots = mask.sum()
-                
-                if valid_spots < 10:  # Skip if too few spots
+                if mask.sum() < 10:
                     continue
-                    
                 z = X[mask, gene_idx]
                 coords = self.coords[mask]
                 W = 1 / (1 + torch.cdist(coords, coords, p=2))
-                
                 N = z.shape[0]
                 z_mean = z.mean()
                 z_centered = z - z_mean
                 S0 = W.sum()
                 Wz = torch.matmul(W, z_centered)
-                
                 current_moran = (N / S0) * (torch.sum(z_centered * Wz) / (torch.sum(z_centered ** 2) + 1e-8))
                 all_morans[qt.item()][gene_idx] = current_moran.item()
-        # Find optimal quantile for each gene
+
         for gene_idx in range(len(gene_indices)):
-            # Collect valid (quantile, moran_i) pairs
-            valid_pairs = []
-            for qt in quantiles:
-                moran_i = all_morans[qt.item()][gene_idx]
-                if not np.isnan(moran_i):
-                    valid_pairs.append((qt.item(), moran_i))
-            # Handle case where no valid Moran's I was calculated
+            valid_pairs = [(qt.item(), all_morans[qt.item()][gene_idx]) for qt in quantiles if not np.isnan(all_morans[qt.item()][gene_idx])]
             if not valid_pairs:
                 best_qts[gene_idx] = max_qt
                 best_cutoffs[gene_idx] = torch.quantile(X[:, gene_idx], max_qt)
                 continue
-                
-            # Unpack valid pairs
+
             x = np.array([p[0] for p in valid_pairs])
             y = np.array([p[1] for p in valid_pairs])
-            # Find elbow point if enough points
-            if len(valid_pairs) >= 3:
-                try:
-                    print("Finding elbow point for gene index:", gene_idx)
-                    kn = KneeLocator(x, y, curve='convex', direction='increasing')
-                    best_qt = kn.knee if kn.knee is not None else x[np.argmax(y)]
-                except Exception as e:
-                    print(f"Error finding elbow point for gene index {gene_idx}: {e}")
-                    best_qt = 0.5
+
+            if len(y) >= window_length:
+                y_smooth = savgol_filter(y, window_length=window_length, polyorder=polyorder)
             else:
-                print(f"Not enough valid pairs for gene index {gene_idx}, using default quantile.")
-                best_qt = 0.5
+                y_smooth = y
+
+            dy = np.gradient(y_smooth)
+            turning_indices = np.where(dy > derivative_threshold)[0]
+            if len(turning_indices) > 0:
+                best_qt = x[turning_indices[0]]
+            else:
+                best_qt = x[np.argmax(y_smooth)]
+
             best_qts[gene_idx] = best_qt
             best_cutoffs[gene_idx] = torch.quantile(X[:, gene_idx], best_qt)
+
         return best_cutoffs
 
-    def set_states(self, qts_prior):
+    def plot_moran_curves(self, save_dir=None, n_samples=10, n_steps=20, max_qt=1.0, window_length=5, polyorder=2, derivative_threshold=0.03):
+        """
+        Plot Moran's I curves for randomly selected genes with smoothing and turning point detection.
+        """
+        gene_indices = self.gene_indices
+        X = self.sub_count.detach().clone() * self.in_tiss_mask.unsqueeze(1)
+        quantiles = torch.linspace(0.05, max_qt, steps=n_steps, dtype=X.dtype)
+        quantiles = torch.round(quantiles, decimals=2)
+
+        selected_genes = np.random.choice(len(gene_indices), size=n_samples, replace=False)
+
+        plt.figure(figsize=(15, 10))
+        for i, gene_idx in enumerate(selected_genes):
+            gene_name = self.gene_selected[gene_idx]
+            morans = []
+            for qt in quantiles:
+                moran_i = float('nan')
+                cutoffs = torch.quantile(X, qt, dim=0)
+                mask = X[:, gene_idx] > cutoffs[gene_idx]
+                if mask.sum() >= 10:
+                    z = X[mask, gene_idx]
+                    coords = self.coords[mask]
+                    W = 1 / (1 + torch.cdist(coords, coords, p=2))
+                    N = z.shape[0]
+                    z_mean = z.mean()
+                    z_centered = z - z_mean
+                    S0 = W.sum()
+                    Wz = torch.matmul(W, z_centered)
+                    moran_i = (N / S0) * (torch.sum(z_centered * Wz) / (torch.sum(z_centered ** 2) + 1e-8))
+                morans.append(moran_i)
+
+            x = np.array([qt.item() for qt in quantiles])
+            y = np.array(morans)
+            valid_mask = ~np.isnan(y)
+            x_valid = x[valid_mask]
+            y_valid = y[valid_mask]
+
+            if len(y_valid) >= window_length:
+                y_smooth = savgol_filter(y_valid, window_length=window_length, polyorder=polyorder)
+            else:
+                y_smooth = y_valid
+
+            dy = np.gradient(y_smooth)
+            turning_indices = np.where(dy > derivative_threshold)[0]
+            turning_qt = x_valid[turning_indices[0]] if len(turning_indices) > 0 else x_valid[np.argmax(y_smooth)]
+
+            plt.subplot(n_samples // 5 + 1, 5, i + 1)
+            plt.plot(x_valid, y_valid, label='Raw Moran\'s I')
+            plt.plot(x_valid, y_smooth, label='Smoothed', linestyle='--')
+            plt.axvline(turning_qt, color='red', linestyle=':', label='Turning Quantile')
+            plt.title(f'Gene {gene_name}')
+            plt.xlabel('Quantile')
+            plt.ylabel('Moran\'s I')
+            plt.legend()
+            plt.tight_layout()
+        if save_dir:
+            plt.savefig(f'{save_dir}/{n_samples}_genes_turning_points.png', bbox_inches='tight')
+        else:
+            plt.show()
+
+    def set_states(self, qts_prior, derivative_threshold=0.02):
         n_genes = len(self.gene_selected)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.invalid_qts = self.impute_qt_vectorized(max_qt=qts_prior)  # Shape [N], the quantile cutoff is an estimation such that expression above it is highly likely to be the source
+        self.invalid_qts = self.impute_qt_vectorized(max_qt=qts_prior, derivative_threshold=derivative_threshold)  # Shape [N], the quantile cutoff is an estimation such that expression above it is highly likely to be the source
         self.invalid_qts.to(device)        
 
     def prep_genes_params(self, add_genes=[], first_n_genes=None):

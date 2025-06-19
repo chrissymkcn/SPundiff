@@ -190,11 +190,11 @@ class PhysicsInformedDiffusionModel(nn.Module):
         n_spots: int,
         n_genes: int,
         coords: torch.Tensor,
+        total_counts: torch.Tensor,
+        neighbors: torch.Tensor,  # Spatial neighborhood matrix
         D_out: float = 0.1,
         D_in: float = 0.02,
         initial_counts_guess: torch.Tensor = None,
-        total_counts: torch.Tensor = None,
-        neighbors: torch.Tensor = None,  # Spatial neighborhood matrix
         in_tiss_mask: torch.Tensor = None,
         alpha: float = 0.8,  # Tissue mask weight
         beta: float = 0.2,  # Spatial regularization weight
@@ -206,23 +206,29 @@ class PhysicsInformedDiffusionModel(nn.Module):
         # self.neighbor_graph = neighbor_graph
         self.alpha = alpha
         self.beta = beta
-        self.total_counts = total_counts if isinstance(total_counts, torch.Tensor) else torch.full((self.n_spots, 1), 10.0)
-        self.total_counts = self.total_counts.unsqueeze(-1) if self.total_counts.dim() == 1 else self.total_counts  # Ensure shape is [n_spots, 1]
+        self.total_counts = total_counts.unsqueeze(-1) if total_counts.dim() == 1 else total_counts  # Ensure shape is [n_spots, 1]
+        # self.total_counts = torch.log1p(self.total_counts)  # Log-transform to stabilize training
         self.in_tiss_mask = in_tiss_mask if in_tiss_mask is not None else torch.ones(n_spots, dtype=torch.bool, device=coords.device)
         self.D = D_out * (1 - in_tiss_mask) + D_in * in_tiss_mask
         self.D = pyro.param(
             "D",
             self.D,
-            constraint=constraints.real
+            constraint=constraints.nonnegative
         )
-
+        self.gene_specific_D = pyro.param(
+            "gene_specific_D",
+            torch.ones(n_genes, device=coords.device),
+            constraint=constraints.nonnegative
+        )
         if initial_counts_guess is not None:
-            self.initial_counts_guess = initial_counts_guess + 1e-6
+            self.initial_counts_guess = initial_counts_guess
+            self.initial_counts_guess = torch.log1p(self.initial_counts_guess)  # Log-transform to stabilize training
         else:
             self.initial_counts_guess = torch.ones((n_spots, n_genes))
                 
         # Add RBF-FD specific initialization
         self.neighbors = neighbors
+        self.compute_laplacian()
 
     def compute_laplacian(self):
         if not hasattr(self, 'laplacian'):
@@ -235,10 +241,13 @@ class PhysicsInformedDiffusionModel(nn.Module):
 
     def forward_diffusion(self, heat_init, steps=10):
         heat = heat_init.clone()
+        total_heat = heat.sum(dim=0, keepdim=True)  # [1, n_genes]
         for _ in range(steps):
             laplacian_update = self.laplacian @ heat
+            laplacian_update = laplacian_update * self.gene_specific_D 
             heat = heat - laplacian_update
             heat = torch.clamp(heat, min=0.0)
+        heat = (heat / heat.sum(dim=0, keepdim=True)) * total_heat
         return heat
 
     def tissue_boundary_constraint(self, diffused_counts, observed_counts):
@@ -246,10 +255,8 @@ class PhysicsInformedDiffusionModel(nn.Module):
         More sophisticated tissue boundary constraint that considers
         distance-dependent diffusion patterns
         """
-        in_tiss_mask = self.in_tiss_mask.float().unsqueeze(1)
-        
         # Compute distance to tissue boundary for each spot
-        boundary_distances = self.compute_boundary_distances(self.in_tiss_mask)  # [n_spots]
+        boundary_distances = self.compute_boundary_distances()  # [n_spots]
         
         # Expected decay pattern from observed data
         observed_decay = self.compute_decay_pattern(
@@ -339,8 +346,8 @@ class PhysicsInformedDiffusionModel(nn.Module):
         self.debug_tensor("observed_counts", observed_counts)
         self.debug_tensor("in_tiss_mask", self.in_tiss_mask)
         self.debug_tensor("neighbors", self.neighbors)
-
-        # 2. Check parameters
+        self.debug_tensor('initial_counts_guess', self.initial_counts_guess)
+        
         original_counts_loc = pyro.param(
             "original_counts_loc",
             self.initial_counts_guess,
@@ -348,7 +355,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
         )
         original_counts_scale = pyro.param(
             "original_counts_scale",
-            0.1 * torch.ones_like(observed_counts),
+            0.01 * torch.ones_like(observed_counts),
             constraint=constraints.nonnegative
         )
         
@@ -375,17 +382,18 @@ class PhysicsInformedDiffusionModel(nn.Module):
         diffused_counts = original_counts.clone()
         old_diffused = diffused_counts.clone()
         diffused_counts = self.forward_diffusion(old_diffused, steps=steps)
-        diffused_counts = diffused_counts / diffused_counts.sum(dim=0, keepdim=True)
-        original_sum = original_counts.sum(dim=0, keepdim=True)
-        diffused_counts = diffused_counts * original_sum
 
+        self.debug_tensor("diffused_counts (after diffusion)", diffused_counts, print_stats=True)
         # 5. Check total_counts and probs computation
         print("\nChecking likelihood computation:")
         total_counts = self.total_counts
+        self.debug_tensor("total_counts", total_counts)
 
         # Compute probs with additional safety
         probs = diffused_counts / total_counts
         self.debug_tensor("probs (before clamping)", probs)
+        probs.clamp_(min=1e-6, max=1.0 - 1e-6)  # Ensure probabilities are valid
+        self.debug_tensor("probs (after clamping)", probs)
         
         # 6. Sample observations
         with pyro.plate("spots", self.n_spots):
@@ -410,6 +418,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
     def model(
         self,
         observed_counts: torch.Tensor,  # Observed gene expression matrix [n_spots, n_genes]
+        steps: int = 10,  # Number of diffusion steps
     ) -> torch.Tensor:
         """
         Probabilistic model incorporating physics and data
@@ -427,7 +436,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
         )
         original_counts_scale = pyro.param(
             "original_counts_scale",
-            0.1 * torch.ones_like(observed_counts),
+            0.01 * torch.ones_like(observed_counts),
             constraint=torch.distributions.constraints.nonnegative
         )  # [n_spots, n_genes]
         
@@ -438,9 +447,8 @@ class PhysicsInformedDiffusionModel(nn.Module):
         )  # [n_spots, n_genes]
         
         # Physics-based diffusion
-        diffused_counts = self.forward_diffusion(original_counts, steps=1)  # [n_spots, n_genes]
-        self.debug_tensor("diffused_counts", diffused_counts, print_stats=True)
-        
+        diffused_counts = self.forward_diffusion(original_counts, steps=steps)  # [n_spots, n_genes]
+
         # Likelihood incorporating:
         # 1. Observation model
         # 2. Tissue mask constraint
@@ -449,6 +457,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
         # 1. Observation likelihood
         total_counts = self.total_counts
         probs = diffused_counts / total_counts
+        probs.clamp_(min=1e-6, max=1.0 - 1e-6)  # Ensure probabilities are valid
         
         # Use Negative Binomial observation model
         with pyro.plate("spots", self.n_spots):
@@ -461,12 +470,13 @@ class PhysicsInformedDiffusionModel(nn.Module):
                 obs=observed_counts
             )
         
+        # Tissue boundary constraint
         pyro.factor(
             'tissue_constraint', self.tissue_boundary_constraint(
-                self, diffused_counts, self.in_tiss_mask, observed_counts)
+                diffused_counts, observed_counts)
         )
         
-        # 3. Spatial regularization using neighbor structure
+        # Spatial regularization using neighbor structure to encourage smoothness
         spatial_diff = torch.sum(
             self.neighbors.unsqueeze(2) * 
             (diffused_counts.unsqueeze(1) - diffused_counts.unsqueeze(0))**2
@@ -479,17 +489,18 @@ class PhysicsInformedDiffusionModel(nn.Module):
     def guide(
         self,
         observed_counts: torch.Tensor,
+        steps: int = 10,  # Number of diffusion steps
     ) -> torch.Tensor:
         """Variational guide/posterior"""
         # Variational parameters
         original_counts_loc = pyro.param(
             "original_counts_loc",
-            self.initial_counts_guess,
+            torch.ones_like(observed_counts),
             constraint=torch.distributions.constraints.nonnegative
         )
         original_counts_scale = pyro.param(
             "original_counts_scale",
-            0.1 * torch.ones_like(observed_counts),
+            0.01 * torch.ones_like(observed_counts),
             constraint=torch.distributions.constraints.nonnegative
         )
         

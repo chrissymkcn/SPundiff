@@ -190,15 +190,14 @@ class PhysicsInformedDiffusionModel(nn.Module):
         n_spots: int,
         n_genes: int,
         coords: torch.Tensor,
-        dt: float = 0.1,  # Time step
         D_out: float = 0.1,
         D_in: float = 0.02,
         initial_counts_guess: torch.Tensor = None,
         total_counts: torch.Tensor = None,
-        alpha: float = 0.8,  # Tissue mask weight
-        beta: float = 0.2,  # Spatial regularization weight
         neighbors: torch.Tensor = None,  # Spatial neighborhood matrix
         in_tiss_mask: torch.Tensor = None,
+        alpha: float = 0.8,  # Tissue mask weight
+        beta: float = 0.2,  # Spatial regularization weight
     ):
         super().__init__()
         self.n_spots = n_spots
@@ -387,12 +386,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
 
         # 5. Check total_counts and probs computation
         print("\nChecking likelihood computation:")
-        total_counts = pyro.param(
-            "nb_concentration",
-            self.total_counts,
-            constraint=constraints.nonnegative
-        )
-        self.debug_tensor("total_counts", total_counts)
+        total_counts = self.total_counts
 
         # Compute probs with additional safety
         probs = diffused_counts / total_counts
@@ -458,13 +452,10 @@ class PhysicsInformedDiffusionModel(nn.Module):
         # 3. Spatial regularization
         
         # 1. Observation likelihood
-        total_counts = pyro.param(
-                    "nb_concentration",
-                    self.total_counts,
-                    constraint=constraints.nonnegative
-                )
-        probs = diffused_counts / (total_counts)
-            # Use Negative Binomial observation model
+        total_counts = self.total_counts
+        probs = diffused_counts / total_counts
+        
+        # Use Negative Binomial observation model
         with pyro.plate("spots", self.n_spots):
             pyro.sample(
                 "obs",

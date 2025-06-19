@@ -252,10 +252,12 @@ class undiff(base):
             'n_spots': X.shape[0],
             'n_genes': X.shape[1],
             'coords': self.coords,
-            
-            'D_constraint': "positive",  # or "bounded" based on your needs
+            'D_out': 0.1,  # Initial diffusion coefficient
+            'D_in': 0.02,
             'initial_counts_guess': X,
             'total_counts': self.ttl_cnts,
+            'neighbors': self.spatial_con,
+            'in_tiss_mask': self.in_tiss_mask,
             'alpha': 0.8,
             'beta': 0.2,
         }
@@ -295,8 +297,6 @@ class undiff(base):
         for step in range(n_epochs):
             loss = svi.step(
                 self.sub_count,
-                self.in_tiss_mask,
-                self.spatial_con
             )
             losses.append(loss)
             

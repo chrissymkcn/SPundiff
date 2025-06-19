@@ -3,7 +3,7 @@ from torch.nn import Parameter
 from functools import partial
 import pyro.contrib.gp as gp
 
-from diffusion_sim import SparseGPRegression, EarlyStopping, PhysicsInformedDiffusionModel
+from diffusion_sim import PhysicsInformedDiffusionModel
 import pyro
 
 from base import base
@@ -214,25 +214,25 @@ class undiff(base):
         return self.res_count, self.sub_count
     
 
-    def define_sgpr(self, X=None, y=None,
-                n_genes=1000, qts_prior=0.8, 
-                noise=0.001, sgpr_approx='VFE'):
-        """
-        Run Sparse GP Regression on the gene expression data.
-        """
-        if X == None:
-            X, y = self.get_initialized_embeddings(n_genes=n_genes, qts_prior=qts_prior, clustering=False)
-        X = X if X.shape[0] == y.shape[1] else X.T  # to ensure X transposed shape matches y
-        kernel = gp.kernels.RBF(input_dim=X.shape[1], lengthscale=torch.ones(X.shape[1]))  # kernel input_dim is the number of features in X, which is the number of genes
-        coords = self.coords - self.coords.mean(dim=0)  # center the coordinates
-        ttl_cnts = self.adata.obs['total_counts'].values
-        ttl_cnts = torch.tensor(ttl_cnts, dtype=torch.float32)
+    # def define_sgpr(self, X=None, y=None,
+    #             n_genes=1000, qts_prior=0.8, 
+    #             noise=0.001, sgpr_approx='VFE'):
+    #     """
+    #     Run Sparse GP Regression on the gene expression data.
+    #     """
+    #     if X == None:
+    #         X, y = self.get_initialized_embeddings(n_genes=n_genes, qts_prior=qts_prior, clustering=False)
+    #     X = X if X.shape[0] == y.shape[1] else X.T  # to ensure X transposed shape matches y
+    #     kernel = gp.kernels.RBF(input_dim=X.shape[1], lengthscale=torch.ones(X.shape[1]))  # kernel input_dim is the number of features in X, which is the number of genes
+    #     coords = self.coords - self.coords.mean(dim=0)  # center the coordinates
+    #     ttl_cnts = self.adata.obs['total_counts'].values
+    #     ttl_cnts = torch.tensor(ttl_cnts, dtype=torch.float32)
         
-        self.model = SparseGPRegression(X, y, kernel, 
-                                coords=coords, in_tiss_mask=self.in_tiss_mask, ttl_cnts=ttl_cnts,
-                                noise=torch.tensor(noise), jitter=1e-5, approx=sgpr_approx, 
-                                )
-        return self.model
+    #     self.model = SparseGPRegression(X, y, kernel, 
+    #                             coords=coords, in_tiss_mask=self.in_tiss_mask, ttl_cnts=ttl_cnts,
+    #                             noise=torch.tensor(noise), jitter=1e-5, approx=sgpr_approx, 
+    #                             )
+    #     return self.model
     
     def define_PID(self, X=None, y=None, n_genes=1000, qts_prior=0.8, **kwargs):
         """

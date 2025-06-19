@@ -225,12 +225,13 @@ class PhysicsInformedDiffusionModel(nn.Module):
         self.neighbors = neighbors
 
     def compute_laplacian(self):
-        self.neighbors.fill_diagonal_(0)
-        degree = torch.diag(self.neighbors.sum(dim=1))
-        laplacian = degree - self.neighbors
-        alpha_diag = torch.diag(self.alpha_vector)
-        scaled_laplacian = alpha_diag @ laplacian
-        self.laplacian = scaled_laplacian
+        if not hasattr(self, 'laplacian'):
+            self.neighbors.fill_diagonal_(0)
+            degree = torch.diag(self.neighbors.sum(dim=1))
+            laplacian = degree - self.neighbors
+            alpha_diag = torch.diag(self.D)  # Diffusion coefficients as diagonal matrix to scale Laplacian 
+            scaled_laplacian = alpha_diag @ laplacian
+            self.laplacian = scaled_laplacian
 
     def forward_diffusion(self, heat_init, steps=10):
         heat = heat_init.clone()
@@ -365,7 +366,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
         # 4. Check diffusion process
         print("\nChecking diffusion process:")
         # Debug Laplacian computation
-        L = self.compute_laplacian(original_counts)
+        L = self.compute_laplacian()
         self.debug_tensor("Laplacian", L.to_dense() if L.is_sparse else L)
 
         # Forward diffusion with intermediate checks

@@ -330,6 +330,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
     def test(
         self,
         observed_counts: torch.Tensor,
+        steps=10,
     ) -> torch.Tensor:
         """Probabilistic model with debugging"""
 
@@ -342,7 +343,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
         # 2. Check parameters
         original_counts_loc = pyro.param(
             "original_counts_loc",
-            torch.ones_like(observed_counts),
+            self.initial_counts_guess,
             constraint=constraints.nonnegative
         )
         original_counts_scale = pyro.param(
@@ -366,24 +367,17 @@ class PhysicsInformedDiffusionModel(nn.Module):
         # 4. Check diffusion process
         print("\nChecking diffusion process:")
         # Debug Laplacian computation
-        L = self.compute_laplacian()
+        self.compute_laplacian()
+        L = self.laplacian
         self.debug_tensor("Laplacian", L.to_dense() if L.is_sparse else L)
 
         # Forward diffusion with intermediate checks
         diffused_counts = original_counts.clone()
-        for step in range(10):  # Assuming steps=1
-            print(f"\nDiffusion step {step + 1}:")
-            try:
-                old_diffused = diffused_counts.clone()
-                diffused_counts = self.forward_diffusion(old_diffused, steps=10)
-                
-                if self.debug_tensor(f"diffused_counts (step {step + 1})", diffused_counts):
-                    print("Intermediate values in forward_diffusion:")
-                    self.debug_tensor("old_diffused", old_diffused)
-                    # Add more specific checks based on your forward_diffusion implementation
-            except Exception as e:
-                print(f"Error in diffusion step {step + 1}: {str(e)}")
-                raise
+        old_diffused = diffused_counts.clone()
+        diffused_counts = self.forward_diffusion(old_diffused, steps=steps)
+        diffused_counts = diffused_counts / diffused_counts.sum(dim=0, keepdim=True)
+        original_sum = original_counts.sum(dim=0, keepdim=True)
+        diffused_counts = diffused_counts * original_sum
 
         # 5. Check total_counts and probs computation
         print("\nChecking likelihood computation:")

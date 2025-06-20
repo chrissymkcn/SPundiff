@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter, find_peaks
 from kneed import KneeLocator
-from diffusion_sim import coords_to_filled_grid, calculate_domain_parameters
+from utils import coords_to_filled_grid, calculate_domain_parameters
 import squidpy as sq
 import torch
 from scipy.sparse import issparse

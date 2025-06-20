@@ -3,7 +3,7 @@ from torch.nn import Parameter
 from functools import partial
 import pyro.contrib.gp as gp
 
-from diffusion_sim import PhysicsInformedDiffusionModel
+from diffusion_sim import PhysicsInformedDiffusionModel, PhysicsInformedSparseGP
 import pyro
 
 from base import base
@@ -170,7 +170,6 @@ class undiff(base):
         invalid_qts = params['invalid_qts']
         genes = self.gene_selected
         out_tiss_filt, in_tiss_filt, out_tiss_sum, in_tiss_sum = self.prep(invalid_qts)
-        
         batch_size = 10
         res = []
         for i, gene in enumerate(genes):
@@ -214,27 +213,51 @@ class undiff(base):
         return self.X_init, self.y_init
     
 
-    # def define_sgpr(self, X=None, y=None,
-    #             n_genes=1000, qts_prior=0.8, 
-    #             noise=0.001, sgpr_approx='VFE'):
-    #     """
-    #     Run Sparse GP Regression on the gene expression data.
-    #     """
-    #     if X == None:
-    #         X, y = self.get_initialized_embeddings(n_genes=n_genes, qts_prior=qts_prior, clustering=False)
-    #     X = X if X.shape[0] == y.shape[1] else X.T  # to ensure X transposed shape matches y
-    #     kernel = gp.kernels.RBF(input_dim=X.shape[1], lengthscale=torch.ones(X.shape[1]))  # kernel input_dim is the number of features in X, which is the number of genes
-    #     coords = self.coords - self.coords.mean(dim=0)  # center the coordinates
-    #     ttl_cnts = self.adata.obs['total_counts'].values
-    #     ttl_cnts = torch.tensor(ttl_cnts, dtype=torch.float32)
+    def define_PISGP(self, X=None, y=None,
+                n_genes=1000, qts_prior=0.8, derivative_threshold=0.02,
+                **kwargs):
+        """
+        Run Sparse GP Regression on the gene expression data.
+        """
+        if X == None:
+            self.get_initialized_embeddings(n_genes=n_genes, qts_prior=qts_prior, 
+                                            derivative_threshold=derivative_threshold, clustering=False)
+            X = self.X_init
+            y = self.y_init
+        X = X.T if X.shape[0] == y.shape[0] else X  # to ensure X's 1st dim has same shape as y's 2nd dim
+        neighbor_graph = self.spatial_con.toarray() if issparse(self.spatial_con) else self.spatial_con
+        self.spatial_con = torch.tensor(neighbor_graph, dtype=torch.float32)
+        self.ttl_cnts = self.adata.obs['total_counts'].values
+        self.ttl_cnts = torch.tensor(self.ttl_cnts, dtype=torch.float32)
+        # Initialize prior mean to be the simplest in-tissue distribution
+        X_prior = self.y_init.detach().clone() * self.in_tiss_mask.unsqueeze(1).float()
+        X_prior = (X_prior / (X_prior.sum(dim=0, keepdim=True) + 1e-8)) * self.y_init.sum(dim=0, keepdim=True)  # rescale to match original total counts
+        params = {
+            'D_out': 0.1,  # Initial diffusion coefficient
+            'D_in': 0.02,
+            'noise': 0.1,
+            'approx': 'VFE',  # 'VFE' or 'FITC'
+            'jitter': 1e-6,  # Small jitter for numerical stability
+            'diffusion_steps': 10,  # Number of diffusion steps
+        }
+        # Update default parameters with any additional kwargs
+        params.update(kwargs)
+        self.model = PhysicsInformedSparseGP(
+            X = X.detach(),
+            y = y.detach(),
+            coords = self.coords,
+            in_tiss_mask = self.in_tiss_mask.detach(),
+            ttl_cnts = self.ttl_cnts.detach(),
+            neighbors = self.spatial_con,
+            X_prior=X_prior,
+            kernel=None,
+            **params
+        )
+        return self.model
         
-    #     self.model = SparseGPRegression(X, y, kernel, 
-    #                             coords=coords, in_tiss_mask=self.in_tiss_mask, ttl_cnts=ttl_cnts,
-    #                             noise=torch.tensor(noise), jitter=1e-5, approx=sgpr_approx, 
-    #                             )
-    #     return self.model
-    
-    def define_PID(self, X=None, y=None, n_genes=1000, qts_prior=0.8, **kwargs):
+    def define_PID(self, X=None, y=None, 
+                    n_genes=1000, qts_prior=0.8, 
+                    diffusion_steps=6, **kwargs):
         """
         Run Sparse GP Regression on the gene expression data.
         """
@@ -252,12 +275,14 @@ class undiff(base):
             'n_spots': X.shape[0],
             'n_genes': X.shape[1],
             'coords': self.coords,
+            'total_counts': self.ttl_cnts.detach(),
+            'neighbors': self.spatial_con,
             'D_out': 0.1,  # Initial diffusion coefficient
             'D_in': 0.02,
             'initial_counts_guess': X.detach(),
-            'total_counts': self.ttl_cnts.detach(),
-            'neighbors': self.spatial_con,
+            'observed_counts': y.detach(),
             'in_tiss_mask': self.in_tiss_mask.detach(),
+            'diffusion_steps': diffusion_steps,  # Number of diffusion steps
             'alpha': 0.8,
             'beta': 0.2,
         }
@@ -269,7 +294,7 @@ class undiff(base):
         )
         return self.model
         
-    def train(self, diffusion_steps=6, learning_rate=0.01, n_epochs=1000):
+    def train(self, learning_rate=0.01, n_epochs=1000):
         """Train the model using SVI"""
         pyro.clear_param_store()
         
@@ -295,10 +320,7 @@ class undiff(base):
         patience_counter = 0
         
         for step in range(n_epochs):
-            loss = svi.step(
-                self.y_init,
-                diffusion_steps,
-            )
+            loss = svi.step()
             losses.append(loss)
             
             # Early stopping
@@ -333,7 +355,7 @@ class undiff(base):
         
         
     @staticmethod
-    def load(path: str):
+    def load(path: str, model_type='PISGP'):
         """Load a trained model from saved parameters"""
         # Load model parameters
         params = torch.load(f"{path}/model.pt", weights_only=False)
@@ -348,19 +370,37 @@ class undiff(base):
         restorer.ttl_cnts = restorer.adata.obs['total_counts'].values
         restorer.ttl_cnts = torch.tensor(restorer.ttl_cnts, dtype=torch.float32)
         restorer.invalid_qts = adata.uns['undiff']['invalid_qts']
-        restorer.model = PhysicsInformedDiffusionModel(
-            n_spots=restorer.X_init.shape[0],
-            n_genes=restorer.X_init.shape[1],
-            coords=restorer.coords,
-            D_out=0.1,  # Initial diffusion coefficient
-            D_in=0.02,
-            total_counts=restorer.ttl_cnts,
-            neighbors=restorer.spatial_con,
-            in_tiss_mask=restorer.in_tiss_mask,
-            initial_counts_guess=restorer.X_init,
-            alpha=0.8,
-            beta=0.2,
-        )
+        if model_type == 'PID':
+            restorer.model = PhysicsInformedDiffusionModel(
+                n_spots=restorer.X_init.shape[0],
+                n_genes=restorer.X_init.shape[1],
+                coords=restorer.coords,
+                D_out=0.1,  # Initial diffusion coefficient
+                D_in=0.02,
+                total_counts=restorer.ttl_cnts,
+                neighbors=restorer.spatial_con,
+                in_tiss_mask=restorer.in_tiss_mask,
+                initial_counts_guess=restorer.X_init,
+                alpha=0.8,
+                beta=0.2,
+            )
+        elif model_type == 'PISGP':
+            restorer.model = PhysicsInformedSparseGP(
+                X=restorer.X_init,
+                y=restorer.y_init,
+                coords=restorer.coords,
+                in_tiss_mask=restorer.in_tiss_mask,
+                ttl_cnts=restorer.ttl_cnts,
+                neighbors=restorer.spatial_con,
+                X_prior=restorer.y_init * restorer.in_tiss_mask.unsqueeze(1).float(),
+                kernel=None,  # Use default kernel
+                D_out=0.1,  # Initial diffusion coefficient
+                D_in=0.02,
+                noise=0.01,  # Default noise level
+                approx='VFE',  # Default approximation method
+                jitter=1e-6,  # Small jitter for numerical stability
+                diffusion_steps=6,  # Default number of diffusion steps
+            )
         return restorer
     
     def get_restored_counts(self, num_samples: int = 100, diffusion_steps=6) -> np.ndarray:

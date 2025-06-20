@@ -409,7 +409,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
     def model(
         self,
         observed_counts: torch.Tensor,  # Observed gene expression matrix [n_spots, n_genes]
-        steps: int = 10,  # Number of diffusion steps
+        diffusion_steps: int = 10,  # Number of diffusion steps
     ) -> torch.Tensor:
         """
         Probabilistic model incorporating physics and data
@@ -449,7 +449,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
         )  # [n_spots, n_genes]
         
         # Physics-based diffusion
-        diffused_counts = self.forward_diffusion(original_counts, steps=steps)  # [n_spots, n_genes]
+        diffused_counts = self.forward_diffusion(original_counts, steps=diffusion_steps)  # [n_spots, n_genes]
         # Likelihood incorporating:
         # 1. Observation model
         # 2. Tissue mask constraint
@@ -490,13 +490,13 @@ class PhysicsInformedDiffusionModel(nn.Module):
     def guide(
         self,
         observed_counts: torch.Tensor,
-        steps: int = 10,  # Number of diffusion steps
+        diffusion_steps: int = 10,  # Number of diffusion steps
     ) -> torch.Tensor:
         """Variational guide/posterior"""
         # Variational parameters
         original_counts_loc = pyro.param(
             "original_counts_loc",
-            torch.ones_like(observed_counts),
+            self.initial_counts_guess,
             constraint=torch.distributions.constraints.nonnegative
         )
         original_counts_scale = pyro.param(

@@ -14,8 +14,8 @@ class base():
     def __init__(self, adata, n_neighs=15):
         self.adata = adata.copy()
         self.var_names = adata.var_names
-        self.sub_count = None
-        self.res_count = None
+        self.y_init = None
+        self.X_init = None
         self.raw_count = adata.X.copy()  # keep a sparse copy of the count
         sq.gr.spatial_neighbors(adata, n_neighs=n_neighs)
         self.spatial_con = adata.obsp['spatial_connectivities']
@@ -207,7 +207,7 @@ class base():
         elif method == 'by_sum':
             scaled_cost = C / c_sum
         elif method == 'by_ttlcnt_range':
-            ttl_cnts = self.sub_count.sum(axis=1).detach().clone()
+            ttl_cnts = self.y_init.sum(axis=1).detach().clone()
             ttl_cnts = ttl_cnts / ttl_cnts.sum()
             ttl_range = [ttl_cnts.min(), ttl_cnts.max()]
             scaled_cost = self.scale_to_range(ttl_range, C)
@@ -224,7 +224,7 @@ class base():
             best_cutoffs: Tensor of optimal cutoffs for each gene
         """
         gene_indices = self.gene_indices
-        X = self.sub_count.detach().clone() * self.in_tiss_mask.unsqueeze(1)
+        X = self.y_init.detach().clone() * self.in_tiss_mask.unsqueeze(1)
         quantiles = torch.linspace(0.05, max_qt, steps=n_steps, dtype=X.dtype)
         quantiles = torch.round(quantiles, decimals=2)
 
@@ -282,7 +282,7 @@ class base():
         Plot Moran's I curves for randomly selected genes with smoothing and turning point detection.
         """
         gene_indices = self.gene_indices
-        X = self.sub_count.detach().clone() * self.in_tiss_mask.unsqueeze(1)
+        X = self.y_init.detach().clone() * self.in_tiss_mask.unsqueeze(1)
         quantiles = torch.linspace(0.05, max_qt, steps=n_steps, dtype=X.dtype)
         quantiles = torch.round(quantiles, decimals=2)
 
@@ -354,7 +354,7 @@ class base():
             [self.adata.var_names.get_loc(g) for g in self.gene_selected],
             dtype=torch.long, device=device
         )  # gene indices indicate gene indices in original data
-        self.sub_count = torch.tensor(raw_count[:, self.gene_indices], dtype=torch.float32, device=device)
+        self.y_init = torch.tensor(raw_count[:, self.gene_indices], dtype=torch.float32, device=device)
         self.var_ttcnt = torch.tensor(self.adata.var.loc[self.gene_selected, 'total_counts'].values, dtype=torch.float32, device=device)
 
 
@@ -439,8 +439,8 @@ class base():
         Prepares the input data for the OT computation.
         Including tissue mask applying to in_tiss, soft thresholding and normalization.
         """
-        X_g = self.sub_count.detach().clone()
-        ttcnt = self.sub_count.sum(dim=0)
+        X_g = self.y_init.detach().clone()
+        ttcnt = self.y_init.sum(dim=0)
         out_tiss = X_g.clone()
         in_tiss = X_g.clone()
         in_tiss_filt, out_tiss_filt = self.soft_thresholding(in_tiss, out_tiss, invalid_qts)            
@@ -466,18 +466,18 @@ class base():
         preserve_sum : bool, default=True
             If True, preserve the column-wise sums during rounding
         return_copy : bool, default=False
-            If True, return a copy of the rounded counts without modifying self.res_count
+            If True, return a copy of the rounded counts without modifying self.X_init
             
         Returns
         -------
         rounded_counts : torch.Tensor
             Rounded count matrix (returned only if return_copy=True)
         """
-        if self.res_count is None:
+        if self.X_init is None:
             raise ValueError("No corrected counts available. Run optimization first.")
             
         # Work with a copy to avoid modifying the original
-        rounded_counts = self.res_count.clone()
+        rounded_counts = self.X_init.clone()
         
         if preserve_sum:
             # Approach 1: Preserve column sums using largest remainder method
@@ -551,7 +551,7 @@ class base():
         if return_copy:
             return rounded_counts
         else:
-            self.res_count = rounded_counts
-            print(f"Rounded counts stored in res_count. Original range: [{self.res_count.min():.2f}, {self.res_count.max():.2f}]")
+            self.X_init = rounded_counts
+            print(f"Rounded counts stored in X_init. Original range: [{self.X_init.min():.2f}, {self.X_init.max():.2f}]")
             return None
         

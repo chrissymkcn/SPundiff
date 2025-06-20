@@ -119,7 +119,7 @@ class undiff(base):
         self.prep_genes_params(add_genes=add_genes, first_n_genes=n_genes)
         self.set_states(qts_prior=qts_prior, derivative_threshold=derivative_threshold)
         # self.compute_shared_OT(self.global_reg) # for updating warmstart
-        self.compute_res_count({
+        self.compute_X_init({
             'invalid_qts': self.invalid_qts,
         })
         
@@ -166,7 +166,7 @@ class undiff(base):
         
         return transported_in
     
-    def compute_res_count(self, params):
+    def compute_X_init(self, params):
         invalid_qts = params['invalid_qts']
         genes = self.gene_selected
         out_tiss_filt, in_tiss_filt, out_tiss_sum, in_tiss_sum = self.prep(invalid_qts)
@@ -183,13 +183,13 @@ class undiff(base):
             transported_in = self.gene_initialization(g_out, g_in, g_outsum, g_insum)
             # transported_in = self.compute_ot(g_out, g_in, g_outsum, g_insum, regs[i])
             res.append(transported_in)
-        self.res_count = torch.stack(res, dim=1)
+        self.X_init = torch.stack(res, dim=1)
         self.round_counts_to_integers()
         
     def get_initialized_embeddings(self, n_genes=100, qts_prior=0.8, derivative_threshold=0.02, clustering=False):
         self.run_initialization(n_genes=n_genes, qts_prior=qts_prior, derivative_threshold=derivative_threshold,)
         if clustering:
-            res = undiff.auto_cluster(self.res_count.detach().cpu().numpy().T, starting_clusters=3, max_clusters=None)  # pass in transposed res_count to have genes as samples
+            res = undiff.auto_cluster(self.X_init.detach().cpu().numpy().T, starting_clusters=3, max_clusters=None)  # pass in transposed X_init to have genes as samples
             self.gene_clusters = {self.gene_selected[i]: lab for i,lab in enumerate(res['cluster_labels'])}
             # compute barycenters of each cluster
             unique_clusters = np.unique(res['cluster_labels'])
@@ -200,7 +200,7 @@ class undiff(base):
                 # get indices of genes in this cluster
                 cluster_genes_idx = torch.tensor(np.where(res['cluster_labels'] == i)[0])
                 self.cluster_genes_dict[i] = np.array(self.gene_selected)[np.where(res['cluster_labels'] == i)[0]]
-                separated_chunk = self.res_count[:, cluster_genes_idx]
+                separated_chunk = self.X_init[:, cluster_genes_idx]
                 print(type(separated_chunk))
                 # twod_genes = []
                 # for j in range(len(cluster_genes)):
@@ -210,8 +210,8 @@ class undiff(base):
                 # separated_chunk = torch.stack(twod_genes, dim=0)
                 gene_groups[i] = separated_chunk.clone()  # do not embed here, just use expression vector directly
                 z_prior[i] = torch.mean(separated_chunk, dim=1)
-            self.res_count = torch.cat([ts for ts in gene_groups.values()], dim=0).T
-        return self.res_count, self.sub_count
+            self.X_init = torch.cat([ts for ts in gene_groups.values()], dim=0).T
+        return self.X_init, self.y_init
     
 
     # def define_sgpr(self, X=None, y=None,
@@ -240,8 +240,8 @@ class undiff(base):
         """
         if X == None:
             self.get_initialized_embeddings(n_genes=n_genes, qts_prior=qts_prior, clustering=False)
-            X = self.res_count
-            y = self.sub_count
+            X = self.X_init
+            y = self.y_init
         X = X if X.shape[0] == y.shape[0] else X.T  # to ensure X has same shape as y
         neighbor_graph = self.spatial_con.toarray() if issparse(self.spatial_con) else self.spatial_con
         self.spatial_con = torch.tensor(neighbor_graph, dtype=torch.float32)
@@ -296,7 +296,7 @@ class undiff(base):
         
         for step in range(n_epochs):
             loss = svi.step(
-                self.sub_count.detach(),
+                self.y_init,
                 diffusion_steps,
             )
             losses.append(loss)
@@ -325,7 +325,8 @@ class undiff(base):
         
         self.adata.uns['undiff'] = {
             'gene_selected': self.gene_selected,
-            'res_count': self.res_count.detach().cpu().numpy(),
+            'X_init': self.X_init.detach().cpu().numpy(),
+            'y_init': self.y_init.detach().cpu().numpy(),
             'invalid_qts': self.invalid_qts.detach().cpu().numpy(),
         }
         self.adata.write_h5ad(f'{path}/adata.h5ad')
@@ -335,30 +336,34 @@ class undiff(base):
     def load(path: str):
         """Load a trained model from saved parameters"""
         # Load model parameters
-        pyro.get_param_store().load(f'{path}/model.pt')
+        params = torch.load(f"{path}/model.pt", weights_only=False)
+        pyro.get_param_store().set_state(params)
         
         adata = sc.read_h5ad(f'{path}/adata.h5ad')
         # Reconstruct the undiff model
         restorer = undiff(adata)
         restorer.gene_selected = adata.uns['undiff']['gene_selected']
-        restorer.sub_count = adata[:, restorer.gene_selected].X.toarray() if issparse(adata[:, restorer.gene_selected].X) else adata[:, restorer.gene_selected].X
-        restorer.sub_count = torch.tensor(restorer.sub_count, dtype=torch.float32)
-        restorer.res_count = adata.uns['undiff']['res_count']
+        restorer.y_init = torch.tensor(adata.uns['undiff']['y_init'], dtype=torch.float32)
+        restorer.X_init = torch.tensor(adata.uns['undiff']['X_init'], dtype=torch.float32)
+        restorer.ttl_cnts = restorer.adata.obs['total_counts'].values
+        restorer.ttl_cnts = torch.tensor(restorer.ttl_cnts, dtype=torch.float32)
         restorer.invalid_qts = adata.uns['undiff']['invalid_qts']
         restorer.model = PhysicsInformedDiffusionModel(
-            n_spots=restorer.res_count.shape[0],
-            n_genes=restorer.res_count.shape[1],
+            n_spots=restorer.X_init.shape[0],
+            n_genes=restorer.X_init.shape[1],
             coords=restorer.coords,
-            dt=0.1,
-            D_init=0.1,
-            D_constraint="positive",
-            initial_counts_guess=restorer.res_count,
-            alpha=0.2,
+            D_out=0.1,  # Initial diffusion coefficient
+            D_in=0.02,
+            total_counts=restorer.ttl_cnts,
+            neighbors=restorer.spatial_con,
+            in_tiss_mask=restorer.in_tiss_mask,
+            initial_counts_guess=restorer.X_init,
+            alpha=0.8,
             beta=0.2,
         )
         return restorer
     
-    def get_restored_counts(self, num_samples: int = 100) -> np.ndarray:
+    def get_restored_counts(self, num_samples: int = 100, diffusion_steps=6) -> np.ndarray:
         """Get restored counts by sampling from posterior"""
         restored_samples = []
         
@@ -366,29 +371,29 @@ class undiff(base):
         for _ in range(num_samples):
             with torch.no_grad():
                 restored = self.model.guide(
-                    self.sub_count,
-                    self.in_tiss_mask,
-                    self.spatial_con
+                    self.y_init,
+                    diffusion_steps=diffusion_steps,  # Use the same number of diffusion steps as during training
                 )
                 restored_samples.append(restored)
         
         # Average samples
         restored_mean = torch.stack(restored_samples).mean(0)
-        
+        restored_mean = (restored_mean / restored_mean.sum(dim=0, keepdim=True)) * self.X_init.sum(dim=0, keepdim=True)  # Rescale to match original total counts
         return restored_mean.numpy()
     
-    def restore_adata(self, copy: bool = False):
+    def restore_adata(self, copy: bool = False, diffusion_steps: int = 6) -> sc.AnnData:
         """Create new AnnData object with restored counts"""
         if copy:
             new_adata = self.adata.copy()
         else:
             new_adata = self.adata
             
-        restored_counts = self.get_restored_counts()
-        if restored_counts.shape[1] == len(self.adata.n_vars):
+        restored_counts = self.get_restored_counts(diffusion_steps=diffusion_steps)
+        if restored_counts.shape[1] == self.adata.n_vars:
             new_adata.layers['restored'] = restored_counts
         else:
-            new_adata.uns['restored'] = restored_counts
+            new_adata = new_adata[:, self.gene_selected].copy()
+            new_adata.layers['restored'] = restored_counts
         
         return new_adata if copy else None
 

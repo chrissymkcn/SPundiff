@@ -381,14 +381,14 @@ class undiff(base):
         restored_mean = (restored_mean / restored_mean.sum(dim=0, keepdim=True)) * self.X_init.sum(dim=0, keepdim=True)  # Rescale to match original total counts
         return restored_mean.numpy()
     
-    def restore_adata(self, copy: bool = False, diffusion_steps: int = 6) -> sc.AnnData:
+    def restore_adata(self, copy: bool = False, diffusion_steps: int = 6, num_samples=1000) -> sc.AnnData:
         """Create new AnnData object with restored counts"""
         if copy:
             new_adata = self.adata.copy()
         else:
             new_adata = self.adata
             
-        restored_counts = self.get_restored_counts(diffusion_steps=diffusion_steps)
+        restored_counts = self.get_restored_counts(diffusion_steps=diffusion_steps, num_samples=num_samples)
         if restored_counts.shape[1] == self.adata.n_vars:
             new_adata.layers['restored'] = restored_counts
         else:

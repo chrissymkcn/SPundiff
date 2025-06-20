@@ -225,7 +225,7 @@ class base():
         """
         gene_indices = self.gene_indices
         X = self.y_init.detach().clone() * self.in_tiss_mask.unsqueeze(1)
-        quantiles = torch.linspace(0.05, max_qt, steps=n_steps, dtype=X.dtype)
+        quantiles = torch.linspace(0.4, max_qt, steps=n_steps, dtype=X.dtype)
         quantiles = torch.round(quantiles, decimals=2)
 
         all_morans = {qt.item(): [float('nan')] * len(gene_indices) for qt in quantiles}
@@ -283,7 +283,7 @@ class base():
         """
         gene_indices = self.gene_indices
         X = self.y_init.detach().clone() * self.in_tiss_mask.unsqueeze(1)
-        quantiles = torch.linspace(0.05, max_qt, steps=n_steps, dtype=X.dtype)
+        quantiles = torch.linspace(0.4, max_qt, steps=n_steps, dtype=X.dtype)
         quantiles = torch.round(quantiles, decimals=2)
 
         selected_genes = np.random.choice(len(gene_indices), size=n_samples, replace=False)

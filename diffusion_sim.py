@@ -1,3 +1,4 @@
+import numpy as np
 from sklearn.cluster import KMeans
 
 import torch.nn as nn
@@ -20,132 +21,82 @@ class PhysicsInformedDiffusionModel(nn.Module):
     """
     def __init__(
         self,
-        n_spots: int,
-        n_genes: int,
+        X: torch.Tensor,  # Initial counts guess [n_genes, n_spots]
+        y: torch.Tensor,  # Observed counts [n_genes, n_spots]
+        X_prior: torch.Tensor,  # prior counts [n_genes, n_spots]
         coords: torch.Tensor,
-        total_counts: torch.Tensor,
+        in_tiss_mask: torch.Tensor,
+        ttl_cnts: torch.Tensor,
         neighbors: torch.Tensor,  # Spatial neighborhood matrix
         D_out: float = 0.1,
         D_in: float = 0.02,
-        initial_counts_guess: torch.Tensor = None,
-        observed_counts: torch.Tensor = None,  # Observed counts [n_spots, n_genes]
-        in_tiss_mask: torch.Tensor = None,
         diffusion_steps: int = 10,
-        alpha: float = 0.8,  # Tissue mask weight
-        beta: float = 0.2,  # Spatial regularization weight
+        alpha: float = 0.1,  # Tissue mask weight
+        beta: float = 0.1,  # Spatial regularization weight
+        cluster_labels: torch.Tensor = None,  # Optional cluster labels for spatial regions
     ):
         super().__init__()
+        n_genes, n_spots = X.shape
         self.n_spots = n_spots
         self.n_genes = n_genes
         self.coords = coords
         # self.neighbor_graph = neighbor_graph
         self.alpha = alpha
         self.beta = beta
-        self.total_counts = total_counts.unsqueeze(-1) if total_counts.dim() == 1 else total_counts  # Ensure shape is [n_spots, 1]
-        # self.total_counts = torch.log1p(self.total_counts)  # Log-transform to stabilize training
+        if ttl_cnts.dim() == 1:
+            cntlen = ttl_cnts.shape[0]
+            if cntlen == n_spots:
+                ttl_cnts = ttl_cnts.unsqueeze(0)
+            elif cntlen == n_genes:
+                ttl_cnts = ttl_cnts.unsqueeze(1)
+        self.ttl_counts = ttl_cnts
         self.in_tiss_mask = in_tiss_mask if in_tiss_mask is not None else torch.ones(n_spots, dtype=torch.bool, device=coords.device)
-        self.observed_counts = observed_counts if observed_counts is not None else torch.zeros((n_spots, n_genes), device=coords.device)
-        if initial_counts_guess is not None:
-            self.initial_counts_guess = self.robust_log_transform(initial_counts_guess)  # Log-transform to stabilize training
-        else:
-            self.initial_counts_guess = torch.ones((n_spots, n_genes))
-                
+        self.y = y
+        self. X = self.robust_log_transform(X)  # Log-transform to stabilize training
+        # Initialize scale_tril with correlation structure 
+        X_normalized = (X - X.mean(dim=0, keepdim=True)) / (X.std(dim=0, keepdim=True) + 1e-6)
+        corr_matrix = torch.mm(X_normalized.t(), X_normalized) / X.size(0)
+        corr_matrix = corr_matrix + 1e-2 * torch.eye(corr_matrix.size(0), device=X.device)
+        self.corr_matrix = torch.linalg.cholesky(corr_matrix)
+
+        self.X_prior = self.robust_log_transform(X_prior)
         # Add RBF-FD specific initialization
         self.neighbors = neighbors
         self.D = D_out * (1 - in_tiss_mask) + D_in * in_tiss_mask
         self.diffusion_steps = diffusion_steps
+        self.laplacian = self.compute_laplacian().to(torch.float32).detach()
+        # self.laplacian = self.laplacian / (self.laplacian.norm(p=2) + 1e-6)  # Normalize Laplacian for stability
+        self.cluster_labels = cluster_labels
         
-    def robust_log_transform(self, x, clip_quantile=0.99):
+    def robust_log_transform(self, x, clip_quantile=0.97):
         # Clip extreme values
         upper = torch.quantile(x, clip_quantile)
-        x_clipped = torch.clamp(x, max=upper)
+        x_clipped = torch.clamp(x, max=upper, min=0.00)
+        # x_clipped = torch.log(x_clipped)
         # Log transform
-        return torch.log1p(x_clipped)
+        return x_clipped
 
     def compute_laplacian(self):
         self.neighbors.fill_diagonal_(0)
         degree = torch.diag(self.neighbors.sum(dim=1))
         laplacian = degree - self.neighbors
-        D = pyro.param('D')
-        alpha_diag = torch.diag(D)  # Pyro param
-        return alpha_diag @ laplacian  
-
+        return laplacian  
     
-    def forward_diffusion(self, heat, steps=10):
-        laplacian = self.compute_laplacian()  # Recompute each time
-        total_heat = heat.sum(dim=0, keepdim=True)
-        gene_specific_D = pyro.param("gene_specific_D")
+    def forward_diffusion(self, initial_heat, steps=1):
+        """Simulate multi-step heat diffusion"""
+        heat = initial_heat.t().clone()  # [n_spots, n_genes]
+        laplacian = self.laplacian
+        alpha = pyro.param('D')  # [n_spots]
+        gene_specific_D = pyro.param('gene_specific_D')  # [n_genes]
+
         for _ in range(steps):
-            laplacian_update = laplacian @ heat
-            laplacian_update = laplacian_update * gene_specific_D  # Pyro param
-            heat = heat - laplacian_update
+            update = laplacian @ heat  # [n_spots, n_genes]
+            update = update * gene_specific_D.unsqueeze(0)  # scale per gene
+            heat = heat - alpha.unsqueeze(1) * update
             heat = torch.clamp(heat, min=0.0)
-        heat = (heat / heat.sum(dim=0, keepdim=True)) * total_heat
-        return heat
 
-    def tissue_boundary_constraint(self, diffused_counts, observed_counts):
-        """
-        More sophisticated tissue boundary constraint that considers
-        distance-dependent diffusion patterns
-        """
-        # Compute distance to tissue boundary for each spot
-        boundary_distances = self.compute_boundary_distances()  # [n_spots]
-        
-        # Expected decay pattern from observed data
-        observed_decay = self.compute_decay_pattern(
-            observed_counts, 
-            boundary_distances
-        )  # [n_bins, n_genes]
-        
-        # Actual decay pattern from diffused counts
-        diffused_decay = self.compute_decay_pattern(
-            diffused_counts, 
-            boundary_distances
-        )  # [n_bins, n_genes]
-        
-        # Compare decay patterns
-        decay_deviation = torch.nn.functional.mse_loss(
-            diffused_decay,
-            observed_decay
-        )
-        
-        return -self.alpha * decay_deviation
+        return heat.t()  # [n_genes, n_spots]
 
-    def compute_boundary_distances(self):
-        """Compute distances to tissue boundary for each spot"""
-        from scipy.ndimage import distance_transform_edt
-        
-        # Convert tissue mask to numpy for distance transform
-        mask_np = self.in_tiss_mask.cpu().numpy()
-        
-        # Compute distance transform
-        dist_in = distance_transform_edt(mask_np)
-        dist_out = distance_transform_edt(1 - mask_np)
-        
-        # Combine: negative outside tissue, positive inside
-        distances = torch.tensor(dist_in - dist_out, device=self.in_tiss_mask.device)
-        
-        return distances
-    
-    def compute_decay_pattern(self, counts, boundary_distances, n_bins=20):
-        """Compute expression decay pattern relative to tissue boundary"""
-        # Define distance bins
-        bins = torch.linspace(
-            boundary_distances.min(),
-            boundary_distances.max(),
-            n_bins + 1
-        )
-        
-        # Compute mean expression for each distance bin
-        patterns = []
-        for i in range(n_bins):
-            mask = (boundary_distances >= bins[i]) & (boundary_distances < bins[i+1])
-            bin_mean = (counts[mask].mean(dim=0) if mask.any() else 
-                    torch.zeros(counts.size(1), device=counts.device))
-            patterns.append(bin_mean)
-        
-        return torch.stack(patterns)  # [n_bins, n_genes]
-    
     def debug_tensor(self, name, tensor, print_stats=True):
         has_nan = torch.isnan(tensor).any()
         has_inf = torch.isinf(tensor).any()
@@ -166,79 +117,76 @@ class PhysicsInformedDiffusionModel(nn.Module):
                 print(f"First few Inf positions: {[(i.item(), j.item()) for i, j in zip(*inf_indices[:2])][:5]}")
             return True
         return False
-
+    
     def test(
         self,
     ) -> torch.Tensor:
-        """Probabilistic model with debugging"""
-
+        """Probabilistic model with debugging (all params are variational parameters)"""
         # 1. Check input tensors
         print("\nChecking inputs:")
-        self.debug_tensor("observed_counts", self.observed_counts)
+        self.debug_tensor("y", self.y)
         self.debug_tensor("in_tiss_mask", self.in_tiss_mask)
         self.debug_tensor("neighbors", self.neighbors)
-        self.debug_tensor('initial_counts_guess', self.initial_counts_guess)
+        self.debug_tensor('X', self. X)
         
-        original_counts_loc = pyro.param(
-            "original_counts_loc",
-            self.initial_counts_guess,
+        X_loc = pyro.param(
+            "X_loc",
+            self. X,
         )
-        original_counts_scale = pyro.param(
-            "original_counts_scale",
-            0.01 * torch.ones_like(self.observed_counts),
-            constraint=constraints.nonnegative
+        X_scale = pyro.param(
+            "X_scale",
+            self.corr_matrix,
+            constraint=constraints.lower_cholesky
         )
         
         print("\nChecking parameters:")
-        self.debug_tensor("original_counts_loc", original_counts_loc)
-        self.debug_tensor("original_counts_scale", original_counts_scale)
+        self.debug_tensor("X_loc", X_loc)
+        self.debug_tensor("X_scale", X_scale)
 
         # 3. Sample original counts
-        original_counts = pyro.sample(
-            "original_counts",
-            dist.LogNormal(original_counts_loc, original_counts_scale).to_event(2)
-        )
-        
-        self.debug_tensor("original_counts (after sampling)", original_counts)
+        X = X_loc  # Convert log counts back to original space
+        self.debug_tensor("X (after sampling)", X)
 
         # 4. Check diffusion process
         print("\nChecking diffusion process:")
         # Debug Laplacian computation
-        L = self.compute_laplacian()
+        L = self.laplacian
         self.debug_tensor("Laplacian", L.to_dense() if L.is_sparse else L)
 
         # Forward diffusion with intermediate checks
-        diffused_counts = original_counts.clone()
-        old_diffused = diffused_counts.clone()
         steps = self.diffusion_steps
-        diffused_counts = self.forward_diffusion(old_diffused, steps=steps)
+        pyro.param('D', self.D, constraint=constraints.nonnegative)  # Ensure D is a Pyro param
+        gene_specific_D = torch.ones(self.n_genes, device=X.device)  # Default gene-specific D
+        pyro.param('gene_specific_D', gene_specific_D, constraint=constraints.positive)  # Ensure gene-specific D is a Pyro param
+        
+        diffused_counts = self.forward_diffusion(X.clone(), steps=steps)
 
         self.debug_tensor("diffused_counts (after diffusion)", diffused_counts, print_stats=True)
-        # 5. Check total_counts and probs computation
+        # 5. Check ttl_counts and probs computation
         print("\nChecking likelihood computation:")
-        total_counts = self.total_counts
-        self.debug_tensor("total_counts", total_counts)
+        ttl_counts = self.ttl_counts
+        self.debug_tensor("ttl_counts", ttl_counts)
 
         # Compute probs with additional safety
-        probs = diffused_counts / total_counts
+        probs = diffused_counts / ttl_counts
         self.debug_tensor("probs (before clamping)", probs)
         probs.clamp_(min=1e-6, max=1.0 - 1e-6)  # Ensure probabilities are valid
         self.debug_tensor("probs (after clamping)", probs)
         
         # 6. Sample observations
-        with pyro.plate("spots", self.n_spots):
+        with pyro.plate("genes", self.n_genes):
             obs = pyro.sample(
-                "obs",
+                'obs',
                 dist.NegativeBinomial(
-                    total_count=total_counts,
-                    probs=probs
-                ).to_event(1),
-                obs=self.observed_counts
+                    total_count=ttl_counts,  # shape: [1, n_spots]
+                    probs=probs  # shape: [n_genes, n_spots]
+                ).to_event(1),  # Treat first dimension as batch size
+                obs=self.y  # Observed counts [n_genes, n_spots]
             )
-        self.debug_tensor("obs", obs)
+        self.debug_tensor("obs (after sampling)", obs)
 
         return {
-            "original_counts": original_counts,
+            "X": X,
             "diffused_counts": diffused_counts,
             "probs": probs,
             'Laplacian': L.to_dense() if L.is_sparse else L,
@@ -255,90 +203,122 @@ class PhysicsInformedDiffusionModel(nn.Module):
         D = pyro.param(
             "D",
             self.D,
-            constraint=constraints.nonnegative
+            constraint=constraints.half_open_interval(0.0, 0.1)
         )
         gene_specific_D = pyro.param(
             "gene_specific_D",
             torch.ones(self.n_genes),
-            constraint=constraints.nonnegative
+            constraint=constraints.half_open_interval(0.0, 0.1)
         )
         
         # Prior for original counts
-        original_counts_loc = pyro.param(
-            "original_counts_loc",
-            self.initial_counts_guess,
-        )
-        original_counts_scale = pyro.param(
-            "original_counts_scale",
-            0.01 * torch.ones_like(self.observed_counts),
-            constraint=torch.distributions.constraints.nonnegative
-        )  # [n_spots, n_genes]
-        
         # Sample original counts
-        original_counts = pyro.sample(
-            "original_counts",
-            dist.LogNormal(original_counts_loc, original_counts_scale).to_event(2)
-        )  # [n_spots, n_genes]
+        # xd = dist.TransformedDistribution(
+        #         base_distribution = dist.MultivariateNormal(
+        #             self.X_prior, scale_tril=self.corr_matrix
+        #             ),
+        #         transforms = [dist.transforms.ExpTransform()]
+        #     )
+        # print("\nxd batch shape:", xd.batch_shape, "event shape:", xd.event_shape)
+        # with pyro.plate("genes", self.n_genes):
+        #     X = pyro.sample('X', xd)
+        
+        X = pyro.param('X', self. X, constraint=constraints.nonnegative)
         
         # Physics-based diffusion
-        diffused_counts = self.forward_diffusion(original_counts, steps=self.diffusion_steps)  # [n_spots, n_genes]
-        # Likelihood incorporating:
-        # 1. Observation model
-        # 2. Tissue mask constraint
-        # 3. Spatial regularization
+        diffused_counts = self.forward_diffusion(X, steps=self.diffusion_steps)  # [n_genes, n_spots]
+        # self.debug_tensor("diffused_counts (after diffusion)", diffused_counts, print_stats=True)
 
         # 1. Observation likelihood
-        total_counts = self.total_counts
-        probs = diffused_counts / total_counts
+        ttl_counts = pyro.param('ttl_cnts', self.ttl_counts, constraint=constraints.nonnegative)  # [1, n_spots]
+        probs = diffused_counts / ttl_counts  # [n_genes, n_spots]
         probs.clamp_(min=1e-6, max=1.0 - 1e-6)  # Ensure probabilities are valid
         
         # Use Negative Binomial observation model
-        with pyro.plate("spots", self.n_spots):
-            pyro.sample(
-                "obs",
-                dist.NegativeBinomial(
-                    total_count=total_counts,  # shape: [n_spots, 1]
-                    probs=probs  # shape: [n_spots, n_genes]
-                ).to_event(1),  # event_shape = [n_genes]
-                obs=self.observed_counts
-            )
-        
-        # Tissue boundary constraint
-        pyro.factor(
-            'tissue_constraint', self.tissue_boundary_constraint(
-                diffused_counts, self.observed_counts)
-        )
-        
-        # Spatial regularization using neighbor structure to encourage smoothness
-        # spatial_diff = torch.sum(
-        #     self.neighbors.unsqueeze(2) * 
-        #     (diffused_counts.unsqueeze(1) - diffused_counts.unsqueeze(0))**2
-        # )
-        # spatial_factor = -self.beta * spatial_diff
-        # pyro.factor("spatial_regularization", spatial_factor)
-        
-        return original_counts
+        # with pyro.plate("genes", self.n_genes):
+        d = dist.NegativeBinomial(
+                    total_count=ttl_counts,  # shape: [n_genes, n_spots]
+                    probs=probs              # shape: [n_genes, n_spots]
+                ).to_event(1)  # Treat first dimension as batch size
 
+        with pyro.plate("genes_obs", self.n_genes):
+            pyro.sample(    
+                    'obs',
+                    d,
+                    obs=self.y
+                )
+        
+        # increase cluster separation
+        if self.cluster_labels is not None:
+            cluster_separation = self._cluster_separation_loss(X, self.cluster_labels)
+            pyro.factor("cluster_separation_loss", -self.alpha * cluster_separation)
+
+        # spatial smoothness penalty
+        lap = self.laplacian
+        norm_lap = lap / (lap.sum(dim=1, keepdim=True) + 1e-6)
+        smoothness_penalty = torch.sum((self.X @ norm_lap) * self.X)
+        pyro.factor("spatial_smoothness", -self.beta * smoothness_penalty)
+                
+        return X
+
+
+    def _cluster_separation_loss(self, true_expr: torch.Tensor, cluster_labels: torch.Tensor) -> torch.Tensor:
+        """Maximize between-cluster distance, minimize within-cluster distance"""
+        unique_clusters = np.unique(cluster_labels)
+        n_clusters = len(unique_clusters)
+        
+        if n_clusters < 2:
+            return torch.tensor(0.0)
+        
+        # Compute cluster centroids
+        centroids = []
+        for cluster_id in unique_clusters:
+            mask = cluster_labels == cluster_id
+            centroid = true_expr[:, mask].mean(dim=1)
+            centroids.append(centroid)
+        centroids = torch.stack(centroids)
+        
+        # Between-cluster distance (maximize)
+        between_dist = torch.pdist(centroids, p=2).mean()
+        
+        # Within-cluster distance (minimize)
+        within_dist = 0.0
+        for i, cluster_id in enumerate(unique_clusters):
+            mask = cluster_labels == cluster_id
+            cluster_expr = true_expr[:, mask]
+            if cluster_expr.shape[1] > 1:
+                centroid = centroids[i].unsqueeze(1)
+                within_dist += torch.norm(cluster_expr - centroid, p=2, dim=0).mean()
+        
+        # Minimize within/between ratio
+        return within_dist / (between_dist + 1e-6)
+    
     def guide(
         self,
     ) -> torch.Tensor:
         """Variational guide/posterior"""
-        # Variational parameters
-        original_counts_loc = pyro.param(
-            "original_counts_loc",
-            self.initial_counts_guess,
-        )
-        original_counts_scale = pyro.param(
-            "original_counts_scale",
-            0.01 * torch.ones_like(self.observed_counts),
-            constraint=torch.distributions.constraints.nonnegative
-        )
+        # # Variational parameters
+        # X_loc = pyro.param(
+        #     "X_loc",
+        #     self. X,
+        # )
+        # X_scale = pyro.param(
+        #     "X_scale",
+        #     self.corr_matrix,
+        #     constraint=constraints.lower_cholesky
+        # )
         
-        # Variational distribution
-        return pyro.sample(
-            "original_counts",
-            dist.LogNormal(original_counts_loc, original_counts_scale).to_event(2)
-        )
+        # # Variational distribution
+        # xd = dist.TransformedDistribution(
+        #         base_distribution=dist.MultivariateNormal(
+        #             X_loc, scale_tril=X_scale
+        #         ),
+        #         transforms=[dist.transforms.ExpTransform()]
+        #     )
+        # with pyro.plate("genes", self.n_genes):
+        #     pyro.sample('X', xd)
+        pass
+
 
 
 
@@ -352,7 +332,7 @@ class PhysicsInformedSparseGP(GPModel):
     def __init__(
         self,
         X: torch.Tensor,  # Initial counts guess [n_genes, n_spots]
-        y: torch.Tensor,  # Observed counts [n_genes, n_spots]
+        y: torch.Tensor,  # Observed counts [n_spots, n_genes]
         coords: torch.Tensor,  # Spatial coordinates [n_spots, 2]
         in_tiss_mask: torch.Tensor,  # Binary tissue mask [n_spots]
         ttl_cnts: torch.Tensor,  # Total counts per spot [n_spots]
@@ -375,12 +355,12 @@ class PhysicsInformedSparseGP(GPModel):
         ), "y needs to be a torch Tensor instead of a {}".format(type(y))
         
         n_genes, n_spots = X.shape
-                
-        n_inducing_genes = min(50, int(n_genes**0.5))
+        X = X.to(torch.float32)
+        n_inducing_genes = min(20, int(n_genes**0.5))
         
         if kernel is None: 
             kernel = gp.kernels.RBF(input_dim=X.shape[1], lengthscale=torch.ones(X.shape[1]))  # kernel input_dim is the number of features in X, which is the number of genes
-        super().__init__(X, y, kernel, jitter=jitter)
+        super().__init__(X, y, kernel, jitter=jitter, mean_function=self.forward_diffusion)
         
         self.noise = PyroParam(noise, constraints.real) if isinstance(noise, torch.Tensor) else PyroParam(torch.tensor(noise, dtype=torch.float32), constraints.real)
         
@@ -405,12 +385,12 @@ class PhysicsInformedSparseGP(GPModel):
             torch.ones(X.size(0)),  # [n_genes]
             constraint=constraints.positive
         )
-        
+        self.laplacian = self.compute_laplacian().to(torch.float32).detach()
         #### for variational inference
         # Initialize counts in log space 
-        self.log_X_init = self._robust_log_transform(X)
+        self. X = self._robust_log_transform(X)
         self.X_loc = PyroParam(
-            self.log_X_init, # [n_genes, n_spots]
+            self. X, # [n_genes, n_spots]
             constraint=constraints.real
         )
         # Initialize scale_tril with correlation structure 
@@ -423,6 +403,7 @@ class PhysicsInformedSparseGP(GPModel):
         )
         
         self.X_prior = X_prior if X_prior is not None else torch.ones_like(X)  # Default prior is zero
+        self.X_prior = self._robust_log_transform(self.X_prior)  # Log-transform prior counts
         
         # Initialize inducing points using k-means clustering on genes
         inducing_values = self._initialize_inducing_points(X)
@@ -453,61 +434,50 @@ class PhysicsInformedSparseGP(GPModel):
         return inducing_values
 
     def _robust_log_transform(self, x, clip_quantile=0.99):
-        """Helper for stable log transform"""
-        upper = torch.quantile(x, clip_quantile)
-        x_clipped = torch.clamp(x, max=upper)
+        """Memory-efficient log transform"""
+        with torch.no_grad():  # Don't track gradients here to save memory
+            upper = torch.quantile(x, clip_quantile)
+            x_clipped = torch.clamp(x, max=upper)
         return torch.log1p(x_clipped)
-
+    
     def compute_laplacian(self):
         """Compute graph Laplacian with diffusion coefficients"""
         self.neighbors.fill_diagonal_(0)
         degree = torch.diag(self.neighbors.sum(dim=1))
         laplacian = degree - self.neighbors
-        D_diag = torch.diag(self.D)  # Spot-specific diffusion coefficients
-        return D_diag @ laplacian
+        return laplacian  # no gradients needed here
 
-    def forward_diffusion(self, X, steps=None):
-        """
-        Physics-informed mean function using diffusion process
-        X: [n_genes, n_spots] in original count space
-        """
-        if steps is None:
-            steps = self.diffusion_steps
+    # def forward_diffusion(self, X):
+    #     """
+    #     Physics-informed mean function using diffusion process
+    #     X: [n_genes, n_spots] in original count space
+    #     """
+    #     print(X.shape)
+    #     laplacian = self.D * self.laplacian  # Laplacian with diffusion coefficients [n_spots, n_spots]
+    #     gene_D = self.gene_specific_D.unsqueeze(0)  # [1, n_genes]
+    #     X = X.t()  # Transpose to [n_spots, n_genes] for diffusion
+    #     ttl_counts = X.sum(dim=0, keepdim=True)  # [1, n_genes]
+
+    #     for _ in range(self.diffusion_steps):
+    #         update = laplacian @ X  # [n_spots, n_genes]
+    #         update = gene_D * update  # Scale by gene-specific diffusion coefficients result = [n_spots, n_genes]
+    #         X = X - update
+    #         X = torch.clamp(X, min=0.0)
             
-        laplacian = self.compute_laplacian()
-        gene_D = self.gene_specific_D.unsqueeze(-1)  # [n_genes, 1]
-        X = X.t()  # Transpose to [n_spots, n_genes] for diffusion
-        total_counts = X.sum(dim=0, keepdim=True)  # [n_genes, 1]
-
+    #     # Preserve total counts per gene
+    #     X = (X / X.sum(dim=0, keepdim=True)) * ttl_counts
+    #     print(X.shape)
+    #     return X
+    
+    def forward_diffusion(self, initial_heat, steps=1):
+        """Simulate one step of heat diffusion"""
+        heat = initial_heat.t().clone()
+        laplacian = self.laplacian
+        alpha = pyro.param('D')
+        gene_specific_D = pyro.param('gene_specific_D').unsqueeze(0) if pyro.param('gene_specific_D').ndim==1 else pyro.param('gene_specific_D')
         for _ in range(steps):
-            # Transpose for spatial operation (now [n_spots, n_genes])
-            update = laplacian @ X  # [n_spots, n_genes]
-            update = update * gene_D  # [n_genes, n_spots]
-            X = X - update
-            X = torch.clamp(X, min=0.0)
-            
-        # Preserve total counts per gene
-        X = (X / X.sum(dim=0, keepdim=True)) * total_counts
-        X = X.t()  # Transpose back to [n_genes, n_spots]
-        
-        return X
-
-    def mean_function(self, X):
-        """
-        The physics-informed mean function for the GP
-        X: [n_genes, n_spots] in original count space (not log space)
-        Returns: [n_genes, n_spots] in count space
-        """
-        # Apply diffusion (operates in count space)
-        diffused = self.forward_diffusion(X)  # [n_genes, n_spots]
-        log_diffused = self._robust_log_transform(diffused)  # Log-transform for stability
-        return log_diffused
-        # # Convert to proportions and scale by total counts
-        # probs = diffused / self.ttl_cnts  # [n_genes, n_spots] / [1, n_spots]
-        # probs = probs.clamp(min=1e-6, max=1-1e-6)
-        
-        # # Return in same shape as y [n_genes, n_spots]
-        # return probs * self.ttl_cnts.t()
+            heat = heat - alpha * laplacian @ heat * gene_specific_D
+        return heat
 
     @pyro_method
     def model(self):
@@ -521,35 +491,39 @@ class PhysicsInformedSparseGP(GPModel):
         # VFE:  y_cov = Qff + noise,                   trace_term = tr(Kff-Qff) / noise
         # y_cov = W @ W.T + D
         # trace_term is added into log_prob
-        X = pyro.sample(dist.TransformedDistribution(
-                base_distribution = dist.MultivariateNormal(
-                    self.X_prior, scale_tril=torch.eye(self.n_spots)
-                    ),
-                transforms = [dist.transforms.ExpTransform()]
-            )
-        ) 
+        with pyro.plate("genes", self.n_genes):
+            X = pyro.sample(
+                'X',
+                dist.TransformedDistribution(
+                    base_distribution = dist.MultivariateNormal(
+                        self.X_prior, scale_tril=torch.eye(self.n_spots)
+                        ),
+                    transforms = [dist.transforms.ExpTransform()]
+                )
+            ) 
         N = X.size(0)
         M = self.Xu.size(0)
-        Kuu = self.kernel(self.Xu).contiguous()
+        Kuu = self.kernel(self.Xu).contiguous()  # [M, M]
         Kuu.view(-1)[:: M + 1] += self.jitter  # add jitter to the diagonal
         assert not torch.isnan(Kuu).any(), "Kuu contains NaNs"
         assert not torch.isinf(Kuu).any(), "Kuu contains Infs"
-        Luu = torch.linalg.cholesky(Kuu)  # the Cholesky decomposition of Kuu = Luu @ Luu.T
-        Kuf = self.kernel(self.Xu, X)
-        W = torch.linalg.solve_triangular(Luu, Kuf, upper=False).t()  # W = inv(Luu).T @ Kuf = Kfu @ inv(Luu).T (an approximation of Kfu @ inv(Kuu))
-
+        Luu = torch.linalg.cholesky(Kuu)  # the Cholesky decomposition of Kuu = Luu @ Luu.T shape [M, M]
+        Kuf = self.kernel(self.Xu, X)  # [M, N]
+        W = torch.linalg.solve_triangular(Luu, Kuf, upper=False).t()  # W = inv(Luu).T @ Kuf = Kfu @ inv(Luu).T (an approximation of Kfu @ inv(Kuu))  shape [N, M]
+        print('W shape:', W.shape)
         D = self.noise.expand(N)
         if self.approx == "FITC" or self.approx == "VFE":
-            Kffdiag = self.kernel(self.X, diag=True)  # diagonal of Kff
-            Qffdiag = W.pow(2).sum(dim=-1)  # 
+            Kffdiag = self.kernel(self.X, diag=True)  # diagonal of Kff  shape [N]
+            Qffdiag = W.pow(2).sum(dim=-1)  # shape [N]
             if self.approx == "FITC":
                 D = D + Kffdiag - Qffdiag
             else:  # approx = "VFE"
-                trace_term = (Kffdiag - Qffdiag).sum() / self.noise
+                trace_term = (Kffdiag - Qffdiag).sum() / self.noise  # shape []
                 trace_term = trace_term.clamp(min=0)
-
-        f_loc = self.mean_function(X)
+                print(f"Trace term shape: {trace_term.shape}, value: {trace_term.item()}")
         
+        f_loc = self.mean_function(X)
+        self.debug_tensor("f_loc", f_loc, print_stats=True)
         if self.y is None:
             f_var = D + W.pow(2).sum(dim=-1)
             return f_loc, f_var
@@ -563,25 +537,46 @@ class PhysicsInformedSparseGP(GPModel):
             
             return pyro.sample(
                 self._pyro_get_fullname("y"),
-                dist.TransformedDistribution(                
-                    dist.LowRankMultivariateNormal(f_loc, W, D).to_event(1),
-                transforms=[dist.transforms.ExpTransform()]),  # Transform back to original space
+                    dist.LowRankMultivariateNormal(f_loc, W, D).to_event(self.y.dim() - 1),  # num_data (num_genes) now become dimensions dependent on the number of GP (num_spots)
                 obs=self.y,
             )
+            
+    def debug_tensor(self, name, tensor, print_stats=True):
+        has_nan = torch.isnan(tensor).any()
+        has_inf = torch.isinf(tensor).any()
+        if print_stats:
+            print(f"\n{name} stats:")
+            print(f"Shape: {tensor.shape}")
+            print(f"Range: [{tensor.min().item():.6e}, {tensor.max().item():.6e}]")
+            print(f"Mean: {tensor.mean().item():.6e}")
+            print(f"Has NaN: {has_nan}")
+            print(f"Has Inf: {has_inf}")
+        if has_nan or has_inf:
+            print(f"\nFound NaN/Inf in {name}!")
+            if has_nan:
+                nan_indices = torch.where(torch.isnan(tensor))
+                print(f"First few NaN positions: {[(i.item(), j.item()) for i, j in zip(*nan_indices[:2])][:5]}")
+            if has_inf:
+                inf_indices = torch.where(torch.isinf(tensor))
+                print(f"First few Inf positions: {[(i.item(), j.item()) for i, j in zip(*inf_indices[:2])][:5]}")
+            return True
+        return False
+    
 
     @pyro_method
     def guide(self):
         self.set_mode("guide")
         self._load_pyro_samples()
-        pyro.sample(
-            'X',
-            dist.TransformedDistribution(
-                base_distribution=dist.MultivariateNormal(
-                    self.X_loc, scale_tril=self.shared_scale_tril
-                ),
-                transforms=[dist.transforms.ExpTransform()]
+        with pyro.plate("genes", self.n_genes):
+            pyro.sample(
+                'X',
+                dist.TransformedDistribution(
+                    base_distribution=dist.MultivariateNormal(
+                        self.X_loc, scale_tril=self.shared_scale_tril
+                    ),
+                    transforms=[dist.transforms.ExpTransform()]
+                )
             )
-        )
 
 
     def forward(self, Xnew, full_cov=False, noiseless=True):

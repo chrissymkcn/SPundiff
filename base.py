@@ -355,8 +355,18 @@ class base():
             dtype=torch.long, device=device
         )  # gene indices indicate gene indices in original data
         self.y_init = torch.tensor(raw_count[:, self.gene_indices], dtype=torch.float32, device=device)
-        self.var_ttcnt = torch.tensor(self.adata.var.loc[self.gene_selected, 'total_counts'].values, dtype=torch.float32, device=device)
-
+        self.cluster_labels = self.get_cluster_labels()
+        
+    def get_cluster_labels(self):
+        ad_in = self.adata[self.adata.obs['in_tissue'] == 1, :]
+        # run standard clustering on in-tissue spots
+        sc.pp.scale(ad_in, max_value=10)
+        sc.pp.pca(ad_in, n_comps=50, svd_solver='arpack')
+        sc.pp.neighbors(ad_in, n_neighbors=15, n_pcs=50)
+        sc.tl.leiden(ad_in, resolution=1.0, key_added='leiden')
+        self.adata.obs['leiden'] = 'O'
+        self.adata.obs.loc[ad_in.obs_names, 'leiden'] = ad_in.obs['leiden']
+        return self.adata.obs['leiden'].astype(str).values
 
     def gene_selection(self, out_tiss_perc=0.8, min_count=100):
         if 'highly_variable' not in self.adata.var.columns:

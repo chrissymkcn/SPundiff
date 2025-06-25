@@ -212,10 +212,77 @@ class undiff(base):
             self.X_init = torch.cat([ts for ts in gene_groups.values()], dim=0).T
         return self.X_init, self.y_init
     
-
-    def define_PISGP(self, X=None, y=None,
-                n_genes=1000, qts_prior=0.8, derivative_threshold=0.02,
-                **kwargs):
+    def define_PISGP(self, X=None, y=None, 
+                    n_genes=100, # Reduced from 1000
+                    qts_prior=0.8, 
+                    derivative_threshold=0.02,
+                    **kwargs):
+        """
+        Memory-optimized version of define_PISGP
+        """
+        if X == None:
+            self.get_initialized_embeddings(n_genes=n_genes, qts_prior=qts_prior, 
+                                            derivative_threshold=derivative_threshold, clustering=False)
+            X = self.X_init
+            y = self.y_init
+            
+        X = X.T  # shape [n_genes, n_spots]
+        
+        # Convert sparse matrix to dense if needed
+        if issparse(self.spatial_con):
+            print("Converting sparse connectivity matrix to dense...")
+            neighbor_graph = self.spatial_con.toarray()
+        else:
+            neighbor_graph = self.spatial_con
+        
+        # Convert to torch tensors with float32 dtype to save memory
+        self.spatial_con = torch.tensor(neighbor_graph, dtype=torch.float32)
+        self.ttl_cnts = torch.tensor(self.adata.obs['total_counts'].values, dtype=torch.float32)
+        
+        # Initialize prior mean
+        X_prior = self.y_init.detach().clone() * self.in_tiss_mask.unsqueeze(1).float()
+        X_prior = (X_prior / (X_prior.sum(dim=0, keepdim=True) + 1e-8)) * self.y_init.sum(dim=0, keepdim=True)
+        X_prior = X_prior.T  # shape [n_genes, n_spots]
+        # Default parameters optimized for memory efficiency
+        params = {
+            'D_out': 0.1,
+            'D_in': 0.02,
+            'noise': 0.1,
+            'approx': 'VFE',
+            'jitter': 1e-6,
+            'diffusion_steps': 6,  # Reduced from 10
+        }
+        
+        # Update default parameters with any additional kwargs
+        params.update(kwargs)
+        
+        # Convert all tensors to float32
+        X = X.detach().to(torch.float32)
+        y = y.detach().to(torch.float32)
+        coords = self.coords.to(torch.float32)
+        in_tiss_mask = self.in_tiss_mask.detach().to(torch.float32)
+        ttl_cnts = self.ttl_cnts.detach().to(torch.float32)
+        X_prior = X_prior.to(torch.float32)
+        
+        self.model = PhysicsInformedSparseGP(
+            X = X,  # shape [n_genes, n_spots]
+            y = y,  # shape [n_spots, n_genes]
+            X_prior = X_prior,  # shape [n_genes, n_spots]
+            coords = coords,
+            in_tiss_mask = in_tiss_mask,
+            ttl_cnts = ttl_cnts,
+            neighbors = self.spatial_con,
+            kernel = None,
+            **params
+        )
+        self.model_name = 'PISGP'
+        return self.model
+        
+    def define_PID(self, X=None, y=None, 
+                    n_genes=1000, 
+                    qts_prior=0.8, 
+                    derivative_threshold=0.02,
+                    **kwargs):
         """
         Run Sparse GP Regression on the gene expression data.
         """
@@ -224,74 +291,57 @@ class undiff(base):
                                             derivative_threshold=derivative_threshold, clustering=False)
             X = self.X_init
             y = self.y_init
-        X = X.T if X.shape[0] == y.shape[0] else X  # to ensure X's 1st dim has same shape as y's 2nd dim
-        neighbor_graph = self.spatial_con.toarray() if issparse(self.spatial_con) else self.spatial_con
-        self.spatial_con = torch.tensor(neighbor_graph, dtype=torch.float32)
-        self.ttl_cnts = self.adata.obs['total_counts'].values
-        self.ttl_cnts = torch.tensor(self.ttl_cnts, dtype=torch.float32)
-        # Initialize prior mean to be the simplest in-tissue distribution
-        X_prior = self.y_init.detach().clone() * self.in_tiss_mask.unsqueeze(1).float()
-        X_prior = (X_prior / (X_prior.sum(dim=0, keepdim=True) + 1e-8)) * self.y_init.sum(dim=0, keepdim=True)  # rescale to match original total counts
-        params = {
-            'D_out': 0.1,  # Initial diffusion coefficient
-            'D_in': 0.02,
-            'noise': 0.1,
-            'approx': 'VFE',  # 'VFE' or 'FITC'
-            'jitter': 1e-6,  # Small jitter for numerical stability
-            'diffusion_steps': 10,  # Number of diffusion steps
-        }
-        # Update default parameters with any additional kwargs
-        params.update(kwargs)
-        self.model = PhysicsInformedSparseGP(
-            X = X.detach(),
-            y = y.detach(),
-            coords = self.coords,
-            in_tiss_mask = self.in_tiss_mask.detach(),
-            ttl_cnts = self.ttl_cnts.detach(),
-            neighbors = self.spatial_con,
-            X_prior=X_prior,
-            kernel=None,
-            **params
-        )
-        return self.model
+            
+        X = X.T  # shape [n_genes, n_spots]
+        y = y.T  # shape [n_genes, n_spots]
         
-    def define_PID(self, X=None, y=None, 
-                    n_genes=1000, qts_prior=0.8, 
-                    diffusion_steps=6, **kwargs):
-        """
-        Run Sparse GP Regression on the gene expression data.
-        """
-        if X == None:
-            self.get_initialized_embeddings(n_genes=n_genes, qts_prior=qts_prior, clustering=False)
-            X = self.X_init
-            y = self.y_init
-        X = X if X.shape[0] == y.shape[0] else X.T  # to ensure X has same shape as y
-        neighbor_graph = self.spatial_con.toarray() if issparse(self.spatial_con) else self.spatial_con
+        # Convert sparse matrix to dense if needed
+        if issparse(self.spatial_con):
+            print("Converting sparse connectivity matrix to dense...")
+            neighbor_graph = self.spatial_con.toarray()
+        else:
+            neighbor_graph = self.spatial_con
+        
+        # Convert to torch tensors with float32 dtype to save memory
         self.spatial_con = torch.tensor(neighbor_graph, dtype=torch.float32)
-        self.ttl_cnts = self.adata.obs['total_counts'].values
-        self.ttl_cnts = torch.tensor(self.ttl_cnts, dtype=torch.float32)
+        self.ttl_cnts = torch.tensor(self.adata.obs['total_counts'].values, dtype=torch.float32)
+        
+        # Initialize prior mean
+        X_prior = self.y_init.detach().clone() * self.in_tiss_mask.unsqueeze(-1).float()  # shape [n_spots, n_genes]
+        X_prior = (X_prior / (X_prior.sum(dim=0, keepdim=True) + 1e-8)) * self.y_init.sum(dim=0, keepdim=True)  # keep gene level total sums the same
+        X_prior = X_prior.T  # shape [n_genes, n_spots]
+                
+        # Convert all tensors to float32
+        X = X.detach().to(torch.float32)
+        y = y.detach().to(torch.float32)
+        coords = self.coords.to(torch.float32)
+        in_tiss_mask = self.in_tiss_mask.detach().to(torch.float32)
+        ttl_cnts = self.ttl_cnts.detach().to(torch.float32)
+        X_prior = X_prior.to(torch.float32)
+        cluster_labels = self.cluster_labels
         # Initialize model
         default_params = {
-            'n_spots': X.shape[0],
-            'n_genes': X.shape[1],
-            'coords': self.coords,
-            'total_counts': self.ttl_cnts.detach(),
-            'neighbors': self.spatial_con,
             'D_out': 0.1,  # Initial diffusion coefficient
             'D_in': 0.02,
-            'initial_counts_guess': X.detach(),
-            'observed_counts': y.detach(),
-            'in_tiss_mask': self.in_tiss_mask.detach(),
-            'diffusion_steps': diffusion_steps,  # Number of diffusion steps
+            'diffusion_steps': 6,  # Number of diffusion steps
             'alpha': 0.8,
             'beta': 0.2,
         }
         # Update default parameters with any additional kwargs
         default_params.update(kwargs)
-        
+        self.kwargs = default_params
         self.model = PhysicsInformedDiffusionModel(
+            X = X,
+            y = y,
+            X_prior = X_prior,
+            coords = coords,
+            in_tiss_mask = in_tiss_mask,
+            ttl_cnts = ttl_cnts,
+            neighbors = self.spatial_con,
+            cluster_labels=cluster_labels,
             **default_params
         )
+        self.model_name = 'PID'
         return self.model
         
     def train(self, learning_rate=0.01, n_epochs=1000):
@@ -316,7 +366,7 @@ class undiff(base):
         # Training loop
         losses = []
         best_loss = float('inf')
-        patience = 20
+        patience = 100
         patience_counter = 0
         
         for step in range(n_epochs):
@@ -335,7 +385,7 @@ class undiff(base):
                 break
             
             # Print progress
-            if step % 20 == 0:
+            if step % 3 == 0:
                 print(f"Step {step}: Loss = {loss:.4f}")
         
         return losses
@@ -347,15 +397,18 @@ class undiff(base):
         
         self.adata.uns['undiff'] = {
             'gene_selected': self.gene_selected,
-            'X_init': self.X_init.detach().cpu().numpy(),
-            'y_init': self.y_init.detach().cpu().numpy(),
+            'X_init': self.X_init.detach().cpu().numpy(),  # [n_spots, n_genes]
+            'y_init': self.y_init.detach().cpu().numpy(),  # [n_spots, n_genes]
             'invalid_qts': self.invalid_qts.detach().cpu().numpy(),
+            'model_name': self.model_name,
+            'cluster_labels': self.cluster_labels if hasattr(self, 'cluster_labels') else None,
+            'kwargs': self.kwargs,
         }
         self.adata.write_h5ad(f'{path}/adata.h5ad')
         
         
     @staticmethod
-    def load(path: str, model_type='PISGP'):
+    def load(path: str, model_type='PID'):
         """Load a trained model from saved parameters"""
         # Load model parameters
         params = torch.load(f"{path}/model.pt", weights_only=False)
@@ -370,29 +423,36 @@ class undiff(base):
         restorer.ttl_cnts = restorer.adata.obs['total_counts'].values
         restorer.ttl_cnts = torch.tensor(restorer.ttl_cnts, dtype=torch.float32)
         restorer.invalid_qts = adata.uns['undiff']['invalid_qts']
-        if model_type == 'PID':
+        restorer.cluster_labels = adata.uns['undiff']['cluster_labels'] if 'cluster_labels' in adata.uns['undiff'] else None
+        restorer.kwargs = adata.uns['undiff']['kwargs']
+        X_prior = restorer.y_init * restorer.in_tiss_mask.unsqueeze(-1).float()
+        X_prior = (X_prior / (X_prior.sum(dim=0, keepdim=True) + 1e-8)) * restorer.y_init.sum(dim=0, keepdim=True)
+        model_name = adata.uns['undiff']['model_name']
+        neighborgraph = torch.tensor(restorer.spatial_con.toarray())
+        if model_name == 'PID':
             restorer.model = PhysicsInformedDiffusionModel(
-                n_spots=restorer.X_init.shape[0],
-                n_genes=restorer.X_init.shape[1],
-                coords=restorer.coords,
-                D_out=0.1,  # Initial diffusion coefficient
-                D_in=0.02,
-                total_counts=restorer.ttl_cnts,
-                neighbors=restorer.spatial_con,
-                in_tiss_mask=restorer.in_tiss_mask,
-                initial_counts_guess=restorer.X_init,
-                alpha=0.8,
-                beta=0.2,
-            )
-        elif model_type == 'PISGP':
-            restorer.model = PhysicsInformedSparseGP(
-                X=restorer.X_init,
-                y=restorer.y_init,
+                X=restorer.X_init.T,  # Transpose to [n_genes, n_spots]
+                y=restorer.y_init.T,  # Transpose to [n_genes, n_spots]
+                X_prior=X_prior.T,  # Transpose to [n_genes, n_spots]
                 coords=restorer.coords,
                 in_tiss_mask=restorer.in_tiss_mask,
                 ttl_cnts=restorer.ttl_cnts,
-                neighbors=restorer.spatial_con,
-                X_prior=restorer.y_init * restorer.in_tiss_mask.unsqueeze(1).float(),
+                neighbors=neighborgraph,
+                D_out=restorer.kwargs['D_out'],  # Initial diffusion coefficient
+                D_in=restorer.kwargs['D_in'],
+                alpha=restorer.kwargs['alpha'],  # Default alpha
+                beta=restorer.kwargs['beta'],  # Default beta
+                diffusion_steps=restorer.kwargs['diffusion_steps'],  # Default number of diffusion steps
+            )
+        elif model_name == 'PISGP':
+            restorer.model = PhysicsInformedSparseGP(
+                X=restorer.X_init.T,  # Transpose to [n_genes, n_spots]
+                y=restorer.y_init,  # [n_spots, n_genes]
+                X_prior=X_prior.T,  # Transpose to [n_genes, n_spots]
+                coords=restorer.coords,
+                in_tiss_mask=restorer.in_tiss_mask,
+                ttl_cnts=restorer.ttl_cnts,
+                neighbors=neighborgraph,
                 kernel=None,  # Use default kernel
                 D_out=0.1,  # Initial diffusion coefficient
                 D_in=0.02,
@@ -410,10 +470,7 @@ class undiff(base):
         # Sample from posterior
         for _ in range(num_samples):
             with torch.no_grad():
-                restored = self.model.guide(
-                    self.y_init,
-                    diffusion_steps=diffusion_steps,  # Use the same number of diffusion steps as during training
-                )
+                restored = self.model.guide()
                 restored_samples.append(restored)
         
         # Average samples
@@ -421,14 +478,22 @@ class undiff(base):
         restored_mean = (restored_mean / restored_mean.sum(dim=0, keepdim=True)) * self.X_init.sum(dim=0, keepdim=True)  # Rescale to match original total counts
         return restored_mean.numpy()
     
-    def restore_adata(self, copy: bool = False, diffusion_steps: int = 6, num_samples=1000) -> sc.AnnData:
+    def restore_adata(self, copy: bool = False, diffusion_steps: int = 6, num_samples=1000, sampling=False, param_key=None) -> sc.AnnData:
         """Create new AnnData object with restored counts"""
         if copy:
             new_adata = self.adata.copy()
         else:
             new_adata = self.adata
-            
-        restored_counts = self.get_restored_counts(diffusion_steps=diffusion_steps, num_samples=num_samples)
+        if sampling:
+            restored_counts = self.get_restored_counts(diffusion_steps=diffusion_steps, num_samples=num_samples)
+        else:
+            if param_key is not None:
+                restored_counts = pyro.get_param_store().get_param(param_key)
+                restored_counts = restored_counts.detach().cpu().numpy()
+            else:
+                raise ValueError("param_key must be provided if sampling is False")
+        if restored_counts.shape[0] != self.adata.n_obs and restored_counts.shape[1] == self.adata.n_obs:
+            restored_counts = restored_counts.T
         if restored_counts.shape[1] == self.adata.n_vars:
             new_adata.layers['restored'] = restored_counts
         else:
@@ -436,4 +501,3 @@ class undiff(base):
             new_adata.layers['restored'] = restored_counts
         
         return new_adata if copy else None
-

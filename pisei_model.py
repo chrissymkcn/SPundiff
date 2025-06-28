@@ -97,11 +97,11 @@ class PhysicsInformedSpatialInverter(nn.Module):
             with pyro.plate("spots_batch", n_spots):
                 with pyro.plate("genes_batch", n_genes):
                     true_expression = pyro.sample(
-                        "true_expression",
-                        dist.LogNormal(
-                            torch.zeros(batch_size, n_spots, n_genes),
-                            torch.ones(batch_size, n_spots, n_genes)
-                        )
+                            "true_expression",
+                            dist.LogNormal(
+                                torch.zeros(batch_size, n_spots, n_genes),
+                                torch.ones(batch_size, n_spots, n_genes)
+                            )
                     )
         
         # Physics-constrained diffusion process

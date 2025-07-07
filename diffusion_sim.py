@@ -52,7 +52,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
         self.ttl_counts = ttl_cnts
         self.in_tiss_mask = in_tiss_mask if in_tiss_mask is not None else torch.ones(n_spots, dtype=torch.bool, device=coords.device)
         self.y = y
-        self. X = self.robust_log_transform(X)  # Log-transform to stabilize training
+        self.X = self.robust_log_transform(X)  # Log-transform to stabilize training
         # Initialize scale_tril with correlation structure 
         X_normalized = (X - X.mean(dim=0, keepdim=True)) / (X.std(dim=0, keepdim=True) + 1e-6)
         corr_matrix = torch.mm(X_normalized.t(), X_normalized) / X.size(0)
@@ -72,7 +72,7 @@ class PhysicsInformedDiffusionModel(nn.Module):
         # Clip extreme values
         upper = torch.quantile(x, clip_quantile)
         x_clipped = torch.clamp(x, max=upper, min=0.00)
-        # x_clipped = torch.log(x_clipped)
+        x_clipped = torch.log(x_clipped)
         # Log transform
         return x_clipped
 
@@ -671,3 +671,29 @@ class PhysicsInformedSparseGP(GPModel):
             cov = cov.expand(cov_shape)
 
         return loc + self.mean_function(Xnew), cov
+
+
+# # When you move a PyroModule to GPU:
+# sgpr_model = sgpr_model.cuda()
+
+# # This moves:
+# sgpr_model._parameters["Xu"]  # ✅ GPU tensor
+# sgpr_model.noise_unconstrained  # ✅ GPU tensor (PyroParam unconstrained version)
+
+# # Pyro Global Store automatically uses the same GPU tensors:
+# _PYRO_PARAM_STORE._params["sgpr.Xu"]  # ✅ Same GPU tensor object as above
+# _PYRO_PARAM_STORE._params["sgpr.noise"]  # ✅ Same GPU tensor object as above
+
+# # Metadata stays on CPU (just integers and constraint objects):
+# sgpr_model._pyro_params["noise"]  # ❌ Just (constraints.positive, None) tuple
+
+# # During SVI step:
+# optimizer = Adam({"lr": 0.01})
+# # Optimizer operates on _PYRO_PARAM_STORE._params.values()
+# # But these are the SAME tensor objects as in PyTorch's _parameters
+# # So optimization automatically updates both stores simultaneously!
+
+# # Proof they're the same object:
+# torch_param = sgpr_model._parameters["Xu"] 
+# pyro_param = pyro.get_param_store()._params["sgpr.Xu"]
+# print(torch_param is pyro_param)  # True - same object!

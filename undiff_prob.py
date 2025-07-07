@@ -4,7 +4,9 @@ from functools import partial
 import pyro.contrib.gp as gp
 
 from diffusion_sim import PhysicsInformedDiffusionModel, PhysicsInformedSparseGP
+from simple_pisei import PhysicsInformedSpatialInverter
 import pyro
+import torch.nn.functional as F
 
 from base import base
 from sklearn.cluster import KMeans, AgglomerativeClustering, SpectralClustering, Birch
@@ -18,10 +20,16 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt 
 import scanpy as sc 
+import squidpy as sq
+import pickle as pkl
+import os
 
 class undiff(base):
     def __init__(self, adata, n_neighs=15):
         super().__init__(adata, n_neighs=n_neighs)
+        self.image_features = None
+        self.ecm_scores = None
+        self.cell_count = None
 
     @staticmethod
     def clustering_model_init(algo, i):
@@ -118,7 +126,6 @@ class undiff(base):
     def run_initialization(self, qts_prior=0.8, derivative_threshold=0.02, n_genes=None, add_genes=[]):
         self.prep_genes_params(add_genes=add_genes, first_n_genes=n_genes)
         self.set_states(qts_prior=qts_prior, derivative_threshold=derivative_threshold)
-        # self.compute_shared_OT(self.global_reg) # for updating warmstart
         self.compute_X_init({
             'invalid_qts': self.invalid_qts,
         })
@@ -400,15 +407,17 @@ class undiff(base):
             'X_init': self.X_init.detach().cpu().numpy(),  # [n_spots, n_genes]
             'y_init': self.y_init.detach().cpu().numpy(),  # [n_spots, n_genes]
             'invalid_qts': self.invalid_qts.detach().cpu().numpy(),
+            'image_features': self.image_features.detach().cpu().numpy() if self.image_features is not None else None,
+            'ecm_scores': self.ecm_scores.detach().cpu().numpy() if self.ecm_scores is not None else None,
+            'cell_count': self.cell_count.detach().cpu().numpy() if self.cell_count is not None else None,
             'model_name': self.model_name,
             'cluster_labels': self.cluster_labels if hasattr(self, 'cluster_labels') else None,
             'kwargs': self.kwargs,
         }
         self.adata.write_h5ad(f'{path}/adata.h5ad')
         
-        
     @staticmethod
-    def load(path: str, model_type='PID'):
+    def load(path: str):
         """Load a trained model from saved parameters"""
         # Load model parameters
         params = torch.load(f"{path}/model.pt", weights_only=False)
@@ -420,16 +429,25 @@ class undiff(base):
         restorer.gene_selected = adata.uns['undiff']['gene_selected']
         restorer.y_init = torch.tensor(adata.uns['undiff']['y_init'], dtype=torch.float32)
         restorer.X_init = torch.tensor(adata.uns['undiff']['X_init'], dtype=torch.float32)
-        restorer.ttl_cnts = restorer.adata.obs['total_counts'].values
-        restorer.ttl_cnts = torch.tensor(restorer.ttl_cnts, dtype=torch.float32)
         restorer.invalid_qts = adata.uns['undiff']['invalid_qts']
         restorer.cluster_labels = adata.uns['undiff']['cluster_labels'] if 'cluster_labels' in adata.uns['undiff'] else None
         restorer.kwargs = adata.uns['undiff']['kwargs']
-        X_prior = restorer.y_init * restorer.in_tiss_mask.unsqueeze(-1).float()
-        X_prior = (X_prior / (X_prior.sum(dim=0, keepdim=True) + 1e-8)) * restorer.y_init.sum(dim=0, keepdim=True)
-        model_name = adata.uns['undiff']['model_name']
+        restorer.ttl_cnts = torch.tensor(restorer.adata.obs['total_counts'].values, dtype=torch.float32)
+        restorer.model_name = adata.uns['undiff']['model_name']
+        
         neighborgraph = torch.tensor(restorer.spatial_con.toarray())
-        if model_name == 'PID':
+        
+        if adata.uns['undiff']['model_name'] == 'PISEI':
+            restorer.image_features = torch.tensor(adata.uns['undiff']['image_features'], dtype=torch.float32) if adata.uns['undiff']['image_features'] is not None else None
+            restorer.ecm_scores = torch.tensor(adata.uns['undiff']['ecm_scores'], dtype=torch.float32) if adata.uns['undiff']['ecm_scores'] is not None else None
+            restorer.cell_count = torch.tensor(adata.uns['undiff']['cell_count'], dtype=torch.float32) if adata.uns['undiff']['cell_count'] is not None else None
+            pca_emb = torch.tensor(adata.obsm['X_pca'].copy(), dtype=torch.float32) if 'X_pca' in adata.obsm else None
+            
+        if adata.uns['undiff']['model_name'] in ['PID', 'PISGP']:
+            X_prior = restorer.y_init * restorer.in_tiss_mask.unsqueeze(-1).float()
+            X_prior = (X_prior / (X_prior.sum(dim=0, keepdim=True) + 1e-8)) * restorer.y_init.sum(dim=0, keepdim=True)
+        
+        if restorer.model_name == 'PID':
             restorer.model = PhysicsInformedDiffusionModel(
                 X=restorer.X_init.T,  # Transpose to [n_genes, n_spots]
                 y=restorer.y_init.T,  # Transpose to [n_genes, n_spots]
@@ -438,13 +456,9 @@ class undiff(base):
                 in_tiss_mask=restorer.in_tiss_mask,
                 ttl_cnts=restorer.ttl_cnts,
                 neighbors=neighborgraph,
-                D_out=restorer.kwargs['D_out'],  # Initial diffusion coefficient
-                D_in=restorer.kwargs['D_in'],
-                alpha=restorer.kwargs['alpha'],  # Default alpha
-                beta=restorer.kwargs['beta'],  # Default beta
-                diffusion_steps=restorer.kwargs['diffusion_steps'],  # Default number of diffusion steps
+                **restorer.kwargs,  # Unpack additional parameters
             )
-        elif model_name == 'PISGP':
+        elif restorer.model_name == 'PISGP':
             restorer.model = PhysicsInformedSparseGP(
                 X=restorer.X_init.T,  # Transpose to [n_genes, n_spots]
                 y=restorer.y_init,  # [n_spots, n_genes]
@@ -454,16 +468,24 @@ class undiff(base):
                 ttl_cnts=restorer.ttl_cnts,
                 neighbors=neighborgraph,
                 kernel=None,  # Use default kernel
-                D_out=0.1,  # Initial diffusion coefficient
-                D_in=0.02,
-                noise=0.01,  # Default noise level
-                approx='VFE',  # Default approximation method
-                jitter=1e-6,  # Small jitter for numerical stability
-                diffusion_steps=6,  # Default number of diffusion steps
+                **restorer.kwargs  # Unpack additional parameters
             )
+        elif restorer.model_name == 'PISEI':
+            restorer.model = PhysicsInformedSpatialInverter(
+                X=restorer.X_init,  # Transpose to [n_genes, n_spots]
+                y=restorer.y_init,  # [n_spots, n_genes]
+                coords=restorer.coords,
+                spatial_adjacency=neighborgraph,
+                pca_emb=pca_emb,
+                image_features=restorer.image_features,
+                ecm_scores=restorer.ecm_scores,
+                cell_count=restorer.cell_count,
+                **restorer.kwargs  # Unpack additional parameters
+                )
+            
         return restorer
     
-    def get_restored_counts(self, num_samples: int = 100, diffusion_steps=6) -> np.ndarray:
+    def get_restored_counts(self, num_samples: int = 100) -> np.ndarray:
         """Get restored counts by sampling from posterior"""
         restored_samples = []
         
@@ -475,7 +497,7 @@ class undiff(base):
         
         # Average samples
         restored_mean = torch.stack(restored_samples).mean(0)
-        restored_mean = (restored_mean / restored_mean.sum(dim=0, keepdim=True)) * self.X_init.sum(dim=0, keepdim=True)  # Rescale to match original total counts
+        # restored_mean = (restored_mean / restored_mean.sum(dim=0, keepdim=True)) * self.X_init.sum(dim=0, keepdim=True)  # Rescale to match original total counts
         return restored_mean.numpy()
     
     def restore_adata(self, copy: bool = False, diffusion_steps: int = 6, num_samples=1000, sampling=False, param_key=None) -> sc.AnnData:
@@ -491,6 +513,8 @@ class undiff(base):
                 restored_counts = pyro.get_param_store().get_param(param_key)
                 restored_counts = restored_counts.detach().cpu().numpy()
             else:
+                print('Available parameters in param store:')
+                print(pyro.get_param_store().get_all_param_names())
                 raise ValueError("param_key must be provided if sampling is False")
         if restored_counts.shape[0] != self.adata.n_obs and restored_counts.shape[1] == self.adata.n_obs:
             restored_counts = restored_counts.T
@@ -501,3 +525,288 @@ class undiff(base):
             new_adata.layers['restored'] = restored_counts
         
         return new_adata if copy else None
+
+    def prepare_tissue_features(self, seg_method='watershed', seg_dir=None):
+        """
+        Calculate image features and ECM/cytoskeletal scores for each spot
+        """
+        print("Extracting image features...")
+        self._extract_image_features()
+        
+        print("Calculating ECM and cytoskeletal module scores...")
+        self._calculate_module_scores()
+        
+        print("Performing cell segmentation...")
+        self._perform_cell_segmentation(method=seg_method, savedir=seg_dir)
+                
+        return {
+            'image_features': self.image_features,
+            'ecm_scores': self.ecm_scores,
+            'cell_count': self.cell_count,
+        }
+        
+    def _extract_image_features(self, crop_size=1.5, scale=1.0):
+        """Extract image features using squidpy"""
+        img = self.adata.uns['spatial'][self.lib_id]['images'][self.img_key]
+        img = sq.im.ImageContainer(img, layer="image")
+        if self.adata.obsm['spatial'].max() > max(img.shape):
+            self.adata.obsm['spatial'] = self.adata.obsm['spatial'] * self.adata.uns['spatial'][self.lib_id]['scalefactors'][f'tissue_{self.img_key}_scalef']
+        # Calculate features with scaling and larger context
+        sq.im.calculate_image_features(
+            self.adata,
+            img,
+            features=["summary", "texture", "histogram"],
+            key_added="image_features",
+            mask_circle=True,
+            spot_scale=crop_size,
+            scale=scale,
+            show_progress_bar=False,
+        )
+        
+        # Extract feature matrix
+        self.image_features = torch.tensor(self.adata.obsm['image_features'].values, dtype=torch.float32)        
+        # Normalize features
+        self.image_features = (self.image_features - self.image_features.mean(dim=0)) / (
+            self.image_features.std(dim=0) + 1e-8
+        )
+        
+        print(f"Extracted {self.image_features.shape[1]} image features per spot in .image_features")
+        
+    def _calculate_module_scores(self):
+        """Calculate ECM and cytoskeletal module scores from gene expression"""
+        
+        # Define gene sets (you can customize these based on your organism)
+        ecm_genes = [
+            'COL1A1', 'COL1A2', 'COL3A1', 'COL4A1', 'COL4A2', 'COL6A1', 'COL6A2',
+            'FN1', 'LAMB1', 'LAMB2', 'LAMC1', 'VTN', 'DCN', 'LUM', 'BGN',
+            'MMP2', 'MMP9', 'MMP14', 'TIMP1', 'TIMP2'
+        ]
+        
+        cytoskeletal_genes = [
+            'ACTB', 'ACTG1', 'ACTA2', 'TUBB', 'TUBB3', 'TUBA1A', 'TUBA1B',
+            'VIM', 'KRT8', 'KRT18', 'KRT19', 'CTNNB1', 'CDH1', 'CDH2',
+            'MYH9', 'MYH10', 'MYL9', 'CFL1', 'ARPC2'
+        ]
+        
+        # Filter genes present in the dataset
+        ecm_genes_present = [g for g in ecm_genes if g in self.adata.var_names]
+        cyto_genes_present = [g for g in cytoskeletal_genes if g in self.adata.var_names]
+        
+        print(f"Found {len(ecm_genes_present)} ECM genes and {len(cyto_genes_present)} cytoskeletal genes")
+        if len(ecm_genes_present) == 0 or len(cyto_genes_present) == 0:
+            raise ValueError("No ECM or cytoskeletal genes found in the dataset. Please check your gene names.")
+        
+        # Calculate module scores using scanpy
+        if len(ecm_genes_present) > 0:
+            sc.tl.score_genes(self.adata, ecm_genes_present, score_name='ecm_score')
+        else:
+            self.adata.obs['ecm_score'] = 0.0
+            
+        if len(cyto_genes_present) > 0:
+            sc.tl.score_genes(self.adata, cyto_genes_present, score_name='cytoskeletal_score')
+        else:
+            self.adata.obs['cytoskeletal_score'] = 0.0
+        
+        # Combine scores
+        ecm_cyto_scores = np.column_stack([
+            self.adata.obs['ecm_score'].values,
+            self.adata.obs['cytoskeletal_score'].values
+        ])
+        
+        self.ecm_scores = torch.tensor(ecm_cyto_scores, dtype=torch.float32)
+        
+        # Normalize scores
+        self.ecm_scores = (self.ecm_scores - self.ecm_scores.mean(dim=0)) / (
+            self.ecm_scores.std(dim=0) + 1e-8
+        )
+        print(f"Calculated ECM and cytoskeletal scores for {self.ecm_scores.shape[0]} spots in .ecm_scores")
+    
+    def _perform_cell_segmentation(self, method='watershed', savedir=None):
+        """Perform cell segmentation to identify cell-containing spots"""
+        # Get the image
+        img = self.adata.uns['spatial'][self.lib_id]['images'][self.img_key]
+        img = sq.im.ImageContainer(img, layer="image")
+        # Use squidpy for segmentation
+        if method == 'cellpose':
+            from cellpose import models
+            def cellpose_he(img, min_size=15, flow_threshold=0.4, channel_cellpose=0):
+                model = models.CellposeModel(model_type="nuclei")
+                res, _, _ = model.eval(
+                    img,
+                    channels=[channel_cellpose, 0],
+                    diameter=None,
+                    min_size=min_size,
+                    invert=True,
+                    flow_threshold=flow_threshold,
+                )
+                return res
+            sq.im.segment(
+                img=img,
+                layer="image",
+                channel=None,
+                method=cellpose_he,
+                flow_threshold=0.4,
+                channel_cellpose=0,
+                min_size=10,
+                layer_added="segmentation_cellpose",
+            )
+            layer_added = "segmentation_cellpose"
+        elif method == 'stardist':
+            from csbdeep.utils import normalize
+            from stardist.models import StarDist2D
+            def stardist_2D_versatile_he(img, nms_thresh=None, prob_thresh=None):
+                # axis_norm = (0,1)   # normalize channels independently
+                axis_norm = (0, 1, 2)  # normalize channels jointly
+                # Make sure to normalize the input image beforehand or supply a normalizer to the prediction function.
+                # this is the default normalizer noted in StarDist examples.
+                img = normalize(img, 1, 99.8, axis=axis_norm)
+                model = StarDist2D.from_pretrained("2D_versatile_he")
+                labels, _ = model.predict_instances(
+                    img, nms_thresh=nms_thresh, prob_thresh=prob_thresh
+                )
+                return labels
+            sq.im.segment(
+                img=img,
+                layer="image",
+                channel=None,
+                method=stardist_2D_versatile_he,
+                layer_added="segmentation_stardist",
+                prob_thresh=0.3,
+                nms_thresh=None,
+            )
+            layer_added = "segmentation_stardist"
+        else:
+            from skimage import exposure, filters, morphology, measure
+            sq.im.process(img, layer="image", method="gray")
+            sq.im.process(img, layer="image_gray", method=exposure.equalize_adapthist, layer_added="image_gray", apply_kwargs={"clip_limit": 0.02})
+            sq.im.process(img, layer='image_gray', method=filters.threshold_local, apply_kwargs={"block_size": 21, "offset": 10}, layer_added='image_gray')
+            sq.im.segment(img, layer="image_gray", method="watershed", geq=False, layer_added="segmentation_watershed")
+            sq.im.process(img, layer='segmentation_watershed', method=morphology.remove_small_objects, apply_kwargs={"min_size": 10}, layer_added='segmentation_watershed')
+            layer_added = "segmentation_watershed"
+        if self.adata.obsm['spatial'].max() > max(img.shape):
+            self.adata.obsm['spatial'] = self.adata.obsm['spatial'] * self.adata.uns['spatial'][self.lib_id]['scalefactors'][f'tissue_{self.img_key}_scalef']
+        sq.im.calculate_image_features(
+            self.adata,
+            img,
+            layer=layer_added,  # layer with segmentation results
+            features="segmentation",
+            key_added=f"segmentation_features",
+            features_kwargs={
+                "segmentation": {
+                    "label_layer": layer_added,  # layer with segmentation results
+                    "props": ["label", "area"],  # mean intensity is calculated for each specified channel
+                    # "props": ["label", "area", "mean_intensity"],  # mean intensity is calculated for each specified channel
+                    # label is the number of segments (i.e. nuclei) identified
+                    # "channels": [0],  # not necessary to specify channels, but can calculate mean intensity for specific channels
+                }
+            },
+            mask_circle=True,
+        )
+        if savedir is not None:
+            if not os.path.exists(savedir):
+                os.makedirs(savedir)
+            img.save(f'{savedir}/{layer_added}')
+            img.show(layer_added, channelwise=True, save=f'{savedir}/{layer_added}/seg.png')
+            plt.close()
+            
+            ## some other diagnostic plots
+            # histogram of segmented cell counts
+            plt.hist(self.adata.obsm['segmentation_features']['segmentation_label'].values, bins=50)
+            quantiles = self.adata.obsm['segmentation_features']['segmentation_label'].quantile([0.95])
+            plt.axvline(quantiles[0.95], color='orange', linestyle='--', label='95% quantile')
+            plt.legend()
+            plt.savefig(f'{savedir}/{layer_added}/segmentation_histogram.png')
+            plt.close()
+            
+            # plot correlation between label and area
+            plt.scatter(
+                self.adata.obsm['segmentation_features']['segmentation_label'],
+                self.adata.obsm['segmentation_features']['segmentation_area_mean'],
+                alpha=0.5,
+            )
+            plt.xlabel("Segmentation label")
+            plt.ylabel("Segmentation area mean")
+            plt.title("Correlation between segmentation label and area mean")
+            plt.savefig(f'{savedir}/{layer_added}/segmentation_label_area_correlation.png')
+            plt.close()
+            
+        # clamp segmentation labels to below 98th quantile to avoid outliers
+        seg_labels = self.adata.obsm['segmentation_features']['segmentation_label']
+        quantile = np.quantile(seg_labels, 0.98)
+        self.adata.obsm['segmentation_features']['segmentation_label'] = np.clip(seg_labels, 0, quantile)
+        # for out-tissue spots, set segmentation label to 0
+        self.adata.obsm['segmentation_features']['segmentation_label'][self.adata.obs['in_tissue'] == 0] = 0
+        self.cell_count = torch.tensor(self.adata.obsm['segmentation_features']['segmentation_label'].values, dtype=torch.float32)
+        print(f"Identified cell counts for {self.cell_count.shape[0]} spots in .cell_count")
+
+    def define_PISEI(self, 
+                    n_genes=100,
+                    qts_prior=0.8,
+                    derivative_threshold=0.03,
+                    prepare_features=True,
+                    **kwargs):
+        """
+        Define simplified PISEI model with adaptive features
+        """
+        seg_kwargs = {k: v for k, v in kwargs.items() if k.startswith('seg_')}
+        if isinstance(prepare_features, bool) and prepare_features:
+            self.prepare_tissue_features(**seg_kwargs)
+        elif isinstance(prepare_features, str):
+            feat_path = os.path.join(prepare_features, 'img_features.pkl')
+            if not os.path.exists(feat_path):
+                res = self.prepare_tissue_features(**seg_kwargs)
+                res = {k: v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v for k, v in res.items()}
+                for k, v in res.items(): print(f"{k}: {v.dtype if isinstance(v, np.ndarray) else v}")
+                with open(feat_path, 'wb') as f:
+                    pkl.dump(res, f)
+            elif os.path.exists(prepare_features):
+                with open(feat_path, 'rb') as f:
+                    res = pkl.load(f)
+                self.image_features = torch.tensor(res['image_features'], dtype=torch.float32)
+                self.ecm_scores = torch.tensor(res['ecm_scores'], dtype=torch.float32)
+                self.cell_count = torch.tensor(res['cell_count'], dtype=torch.float32)
+                
+        for feats in ['image_features', 'ecm_scores', 'cell_count']:
+            if getattr(self, feats) is None:
+                Warning(f"{feats} is not defined. Not using it in the model.")
+            else:
+                print(f"Using {feats} with shape {getattr(self, feats).shape} and dtype {getattr(self, feats).dtype}")
+        # Initialize expression data
+        if not hasattr(self, 'X_init') or self.X_init is None:
+            self.get_initialized_embeddings(
+                n_genes=n_genes,
+                qts_prior=qts_prior,
+                derivative_threshold=derivative_threshold,
+                clustering=False
+            )
+        
+        neighbor_graph = self.spatial_con.toarray() if issparse(self.spatial_con) else self.spatial_con
+        spatial_adjacency = torch.tensor(neighbor_graph, dtype=torch.float32)
+        if 'X_pca' not in self.adata.obsm:
+            sc.pp.scale(self.adata, max_value=10)
+            # note highly variable genes should have already been computed when selecting genes
+            sc.pp.pca(self.adata, n_comps=50, svd_solver='arpack', mask_var="highly_variable", key_added='X_pca')
+        pca_emb = torch.tensor(self.adata.obsm['X_pca'].copy(), dtype=torch.float32)
+    
+        default_params = {
+            'diffusion_steps': 3,  # Number of diffusion steps
+        }
+        # Update default parameters with any additional kwargs
+        kwargs = {k: v for k, v in kwargs.items() if not k.startswith('seg_')}
+        default_params.update(kwargs)
+        self.kwargs = default_params
+
+        # Create model
+        self.model = PhysicsInformedSpatialInverter(
+            X=self.X_init,  # shape [n_spots, n_genes]
+            y=self.y_init,  # shape [n_spots, n_genes]
+            coords=self.coords,
+            spatial_adjacency=spatial_adjacency,  # shape [n_spots, n_spots]
+            pca_emb=pca_emb,  # shape [n_spots, n_spots]
+            image_features=self.image_features,  # shape [n_spots, n_features]
+            ecm_scores=self.ecm_scores,  # shape [n_spots, 2] (ECM and cytoskeletal scores)
+            cell_mask=self.cell_count,  # shape [n_spots] (cell counts)
+            **default_params
+        )
+        self.model_name = 'PISEI'
+        return self.model

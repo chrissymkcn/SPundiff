@@ -336,6 +336,7 @@ class base():
             plt.savefig(f'{save_dir}/{n_samples}_genes_turning_points.png', bbox_inches='tight')
         else:
             plt.show()
+        plt.close()
 
     def set_states(self, qts_prior, derivative_threshold=0.02):
         n_genes = len(self.gene_selected)
@@ -361,9 +362,10 @@ class base():
         ad_in = self.adata[self.adata.obs['in_tissue'] == 1, :]
         # run standard clustering on in-tissue spots
         sc.pp.scale(ad_in, max_value=10)
-        sc.pp.pca(ad_in, n_comps=50, svd_solver='arpack')
+        sc.pp.highly_variable_genes(ad_in, flavor="seurat", n_top_genes=3000)
+        sc.pp.pca(ad_in, n_comps=50, svd_solver='arpack', use_highly_variable=True)
         sc.pp.neighbors(ad_in, n_neighbors=15, n_pcs=50)
-        sc.tl.leiden(ad_in, resolution=1.0, key_added='leiden')
+        sc.tl.leiden(ad_in, resolution=1.5, key_added='leiden', flavor="igraph", n_iterations=2)
         self.adata.obs['leiden'] = 'O'
         self.adata.obs.loc[ad_in.obs_names, 'leiden'] = ad_in.obs['leiden']
         return self.adata.obs['leiden'].astype(str).values

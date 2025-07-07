@@ -805,7 +805,7 @@ class undiff(base):
             pca_emb=pca_emb,  # shape [n_spots, n_spots]
             image_features=self.image_features,  # shape [n_spots, n_features]
             ecm_scores=self.ecm_scores,  # shape [n_spots, 2] (ECM and cytoskeletal scores)
-            cell_mask=self.cell_count,  # shape [n_spots] (cell counts)
+            cell_count=self.cell_count,  # shape [n_spots] (cell counts)
             **default_params
         )
         self.model_name = 'PISEI'

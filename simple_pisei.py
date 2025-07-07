@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import pyro
 import pyro.distributions as dist
+from pyro.nn import PyroModule, PyroParam, PyroSample, pyro_method
 from pyro.infer import SVI, Trace_ELBO
 from pyro.optim import Adam
 import torch.nn.functional as F
@@ -10,7 +11,7 @@ from sklearn.decomposition import PCA
 from scipy.spatial.distance import pdist, squareform
 
 
-class PhysicsInformedSpatialInverter(nn.Module):
+class PhysicsInformedSpatialInverter(PyroModule):
     """
     Simplified physics-informed model for spatial transcriptomics diffusion correction.
     
@@ -29,7 +30,7 @@ class PhysicsInformedSpatialInverter(nn.Module):
                 pca_emb: torch.Tensor = None,
                 image_features: torch.Tensor = None,
                 ecm_scores: torch.Tensor = None,
-                cell_mask: torch.Tensor = None,
+                cell_count: torch.Tensor = None,
                 cluster_labels: torch.Tensor = None,
                 diffusion_steps: int = 3,
                 ):  # Mass conservation weight
@@ -49,7 +50,7 @@ class PhysicsInformedSpatialInverter(nn.Module):
         self.cov_matrix = torch.linalg.cholesky(cov_matrix)
         
         # Store masks and features
-        self.cell_mask = cell_mask if cell_mask is not None else torch.ones(self.n_spots, dtype=torch.bool)
+        self.cell_count = cell_count if cell_count is not None else torch.ones(self.n_spots, dtype=torch.bool)
         self.cluster_labels = cluster_labels
         
         # Adaptive Laplacian matrices
@@ -140,6 +141,7 @@ class PhysicsInformedSpatialInverter(nn.Module):
         # Log transform
         return x_clipped
 
+    @pyro_method
     def model(self):
         """
         Pyro probabilistic model
@@ -148,7 +150,6 @@ class PhysicsInformedSpatialInverter(nn.Module):
             self.Y: [n_spots, n_genes]
             total_counts: [n_spots]
         """
-        batch_size = 1  # Single batch for now
         with pyro.plate("spots", self.n_spots):
                 spot_diffusion_rates = pyro.sample(
                     "spot_diffusion_rates",
@@ -204,7 +205,7 @@ class PhysicsInformedSpatialInverter(nn.Module):
         true_total = true_expression.sum(dim=1)
         obs_total = self.Y.sum(dim=1)
         mass_conservation_loss = torch.sum((true_total - obs_total) ** 2) / torch.sum(obs_total ** 2)  # Normalize by total observed expression
-        pyro.factor("mass_conservation", -0.1 * mass_conservation_loss)
+        pyro.factor("mass_conservation", - 1.0 * mass_conservation_loss)
         
         # 2. Spatial smoothness penalty using combined Laplacian
         if self.adaptive_laplacian is not None:
@@ -214,11 +215,11 @@ class PhysicsInformedSpatialInverter(nn.Module):
         observed_smoothness = torch.trace(self.Y.T @ combined_laplacian @ self.Y)
         smoothness_penalty = torch.trace(true_expression.T @ combined_laplacian @ true_expression)
         smoothness_penalty = smoothness_penalty / (observed_smoothness + 1e-8)  # Avoid division by zero
-        pyro.factor("spatial_smoothness", -0.1 * smoothness_penalty)
+        pyro.factor("spatial_smoothness", - 1.0 * smoothness_penalty)
         
         # 3. Non-cell penalty - penalize expression in non-cell containing spots
-        if self.cell_mask is not None:
-            non_cell_expression_dist = self.cell_mask.float() / (self.cell_mask.sum() + 1e-8)  # Normalize by total cell count
+        if self.cell_count is not None:
+            non_cell_expression_dist = self.cell_count.float() / (self.cell_count.sum() + 1e-8)  # Normalize by total cell count
             non_cell_expression_dist = non_cell_expression_dist.unsqueeze(1)
             norm_true_expression = true_expression.sum(dim=1)
             norm_true_expression = norm_true_expression / (norm_true_expression.sum())
@@ -226,12 +227,12 @@ class PhysicsInformedSpatialInverter(nn.Module):
             cell_count_penalty = torch.mean(
                 torch.abs(norm_true_expression - non_cell_expression_dist)
             )
-            pyro.factor("non_cell_penalty", -0.1 * cell_count_penalty)
+            pyro.factor("non_cell_penalty", - 1.0 * cell_count_penalty)
             
         # 4. Cluster separation loss
         if self.cluster_labels is not None:
             cluster_separation_loss = self._cluster_separation_loss(true_expression, self.cluster_labels)
-            pyro.factor("cluster_separation", -0.1 * cluster_separation_loss)
+            pyro.factor("cluster_separation", - 1.0 * cluster_separation_loss)
 
     def _cluster_separation_loss(self, true_expr: torch.Tensor, cluster_labels: torch.Tensor) -> torch.Tensor:
         """Maximize between-cluster distance, minimize within-cluster distance"""
@@ -264,6 +265,7 @@ class PhysicsInformedSpatialInverter(nn.Module):
         # Minimize within/between ratio
         return within_dist / (between_dist + 1e-6)
     
+    @pyro_method
     def guide(self):
         """Variational guide"""
         
@@ -316,7 +318,7 @@ class PhysicsInformedSpatialInverter(nn.Module):
         return true_expression
 
 
-class SpotDiffusionEncoder(nn.Module):
+class SpotDiffusionEncoder(PyroModule):
     """
     Encoder that learns spot-specific diffusion coefficients from tissue features
     """

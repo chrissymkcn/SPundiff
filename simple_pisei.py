@@ -37,12 +37,14 @@ class PhysicsInformedSpatialInverter(PyroModule):
         
         super().__init__()
         
-        self.X = self.robust_log_transform(X)
+        self.X = X
         self.Y = y
         self.n_spots, self.n_genes = X.shape
         self.coords = coords
         self.diffusion_steps = diffusion_steps
         self.pca_emb = pca_emb
+        # Compute and store total counts per spot (observed)
+        self.total_counts = X.sum(dim=1, keepdim=True)  # [n_spots, 1]
         
         pca_emb_norm = (pca_emb - pca_emb.mean(dim=0, keepdim=True)) / (pca_emb.std(dim=0, keepdim=True) + 1e-6)
         cov_matrix = torch.mm(pca_emb_norm.t(), pca_emb_norm) / (pca_emb_norm.size(0))
@@ -128,9 +130,19 @@ class PhysicsInformedSpatialInverter(PyroModule):
         for _ in range(self.diffusion_steps):
             # Apply diffusion: x_new = x - D * L * x
             diffusion_update = torch.matmul(combined_laplacian, expression)
-            expression = expression - spot_diffusion_rates.unsqueeze(1) * diffusion_update
-            expression = torch.clamp(expression, min=0.0)
+            # Constrain the update magnitude to prevent instability
+            update_scale = torch.norm(diffusion_update, dim=1, keepdim=True)
+            expression_scale = torch.norm(expression, dim=1, keepdim=True) + 1e-8
+            scale_factor = torch.clamp(update_scale / expression_scale, max=0.5)
+            normalized_update = diffusion_update * (0.5 / (scale_factor + 1e-8))
             
+            expression = expression - spot_diffusion_rates.unsqueeze(1) * normalized_update
+            # expression = expression - spot_diffusion_rates.unsqueeze(1) * diffusion_update
+            expression = torch.clamp(expression, min=0.0)
+        
+        current_total = expression.sum(dim=0, keepdim=True)
+        # Normalize to match total counts
+        expression = expression * (self.total_counts / (current_total + 1e-10))
         return expression
     
     def robust_log_transform(self, x, clip_quantile=0.97):
@@ -153,7 +165,7 @@ class PhysicsInformedSpatialInverter(PyroModule):
         with pyro.plate("spots", self.n_spots):
                 spot_diffusion_rates = pyro.sample(
                     "spot_diffusion_rates",
-                    dist.Beta(2.0, 8.0)
+                    dist.Beta(1.5, 10.0)
                 )
         
         # Sample true undiffused expression
@@ -162,7 +174,7 @@ class PhysicsInformedSpatialInverter(PyroModule):
                 true_expression = pyro.sample(
                     "true_expression",
                     dist.LogNormal(
-                        self.X,
+                        self.robust_log_transform(self.Y),
                         torch.ones_like(self.Y) * 0.1  # Small scale for stability
                     )
                 )
@@ -201,11 +213,11 @@ class PhysicsInformedSpatialInverter(PyroModule):
     def _add_physics_penalties(self, true_expression):
         """Add physics-based penalty terms"""
         
-        # 1. Mass conservation penalty
-        true_total = true_expression.sum(dim=1)
-        obs_total = self.Y.sum(dim=1)
-        mass_conservation_loss = torch.sum((true_total - obs_total) ** 2) / torch.sum(obs_total ** 2)  # Normalize by total observed expression
-        pyro.factor("mass_conservation", - 1.0 * mass_conservation_loss)
+        # # 1. Mass conservation penalty
+        # true_total = true_expression.sum(dim=1)
+        # obs_total = self.Y.sum(dim=1)
+        # mass_conservation_loss = torch.sum((true_total - obs_total) ** 2) / torch.sum(obs_total ** 2)  # Normalize by total observed expression
+        # pyro.factor("mass_conservation", - 1.0 * mass_conservation_loss)
         
         # 2. Spatial smoothness penalty using combined Laplacian
         if self.adaptive_laplacian is not None:
@@ -233,6 +245,11 @@ class PhysicsInformedSpatialInverter(PyroModule):
         if self.cluster_labels is not None:
             cluster_separation_loss = self._cluster_separation_loss(true_expression, self.cluster_labels)
             pyro.factor("cluster_separation", - 1.0 * cluster_separation_loss)
+            
+        # Add entropy regularization to avoid concentration in few spots
+        norm_expr = true_expression / (true_expression.sum(dim=0, keepdim=True) + 1e-8)
+        entropy = -torch.mean(torch.sum(norm_expr * torch.log(norm_expr + 1e-8), dim=0))
+        pyro.factor("entropy_regularization", 0.5 * entropy)  # Maximize entropy (distribute expression)
 
     def _cluster_separation_loss(self, true_expr: torch.Tensor, cluster_labels: torch.Tensor) -> torch.Tensor:
         """Maximize between-cluster distance, minimize within-cluster distance"""
@@ -288,8 +305,8 @@ class PhysicsInformedSpatialInverter(PyroModule):
             )
         
         # Variational parameters for true expression
-        loc_param = pyro.param("loc_param", self.robust_log_transform(self.Y))
-        scale_param = pyro.param("scale_param", torch.ones_like(self.Y) * 0.1,
+        loc_param = pyro.param("loc_param", self.robust_log_transform(self.X))
+        scale_param = pyro.param("scale_param", torch.ones_like(self.X) * 0.1,
                             constraint=dist.constraints.positive)
         
         with pyro.plate("spots_expr", self.n_spots, dim=-2):
@@ -299,6 +316,7 @@ class PhysicsInformedSpatialInverter(PyroModule):
                     dist.LogNormal(loc_param,
                                 scale_param)
                 )
+        
         # # to test: consider multivariate normal logtransformed?
         # loc_param = pyro.param("loc_param", self.X.T)
         # scale_tril_param = pyro.param("scale_tril_param", torch.eye(self.cov_matrix.size(0)), constraint=dist.constraints.lower_cholesky)

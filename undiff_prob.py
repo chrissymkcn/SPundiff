@@ -373,7 +373,7 @@ class undiff(base):
         # Training loop
         losses = []
         best_loss = float('inf')
-        patience = 100
+        patience = 20
         patience_counter = 0
         
         for step in range(n_epochs):
@@ -523,7 +523,6 @@ class undiff(base):
         else:
             new_adata = new_adata[:, self.gene_selected].copy()
             new_adata.layers['restored'] = restored_counts
-        
         return new_adata if copy else None
 
     def prepare_tissue_features(self, seg_method='watershed', seg_dir=None):
@@ -806,6 +805,7 @@ class undiff(base):
             image_features=self.image_features,  # shape [n_spots, n_features]
             ecm_scores=self.ecm_scores,  # shape [n_spots, 2] (ECM and cytoskeletal scores)
             cell_count=self.cell_count,  # shape [n_spots] (cell counts)
+            cluster_labels=self.cluster_labels,
             **default_params
         )
         self.model_name = 'PISEI'

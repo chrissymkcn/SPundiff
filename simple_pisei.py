@@ -3,13 +3,8 @@ import torch.nn as nn
 import pyro
 import pyro.distributions as dist
 from pyro.nn import PyroModule, PyroParam, PyroSample, pyro_method
-from pyro.infer import SVI, Trace_ELBO
-from pyro.optim import Adam
 import torch.nn.functional as F
 import numpy as np
-from sklearn.decomposition import PCA
-from scipy.spatial.distance import pdist, squareform
-
 
 class PhysicsInformedSpatialInverter(PyroModule):
     """
@@ -86,7 +81,36 @@ class PhysicsInformedSpatialInverter(PyroModule):
         else:
             self.diffusion_encoder = None
             self.img_features = None
-            
+        self.scale_factor = self._compute_simple_data_scale()
+
+    def _compute_simple_data_scale(self):
+        """Simple, fast scale computation from data statistics"""
+        # Use simple data statistics that are fast to compute
+        n_total = self.n_spots * self.n_genes
+        sum_Y = self.Y.sum().item()
+        mean_Y = self.Y.mean().item()
+        max_Y = self.Y.max().item()
+        
+        # Rough Poisson likelihood magnitude: sum_Y * log(mean_Y)
+        likelihood_magnitude = sum_Y * np.log(mean_Y + 1)
+        
+        # Simple penalty magnitude estimate: roughly O(1) for normalized penalties
+        typical_penalty_magnitude = 1.0
+        
+        # Scale to make penalties ~5% of likelihood
+        scale_factor = likelihood_magnitude * 0.1 / typical_penalty_magnitude
+        
+        # Add adjustment for count ranges
+        if max_Y > 1000:
+            scale_factor *= 2
+        elif max_Y < 10:
+            scale_factor *= 0.5
+        
+        final_scale = max(100.0, min(scale_factor, 50000.0))
+        
+        print(f"Simple data scale: {final_scale:.0f} (likelihood est: {likelihood_magnitude:.0f})")
+        return final_scale
+    
     def _compute_spatial_laplacian(self, adjacency):
         """Compute normalized graph Laplacian from adjacency matrix"""
         adjacency = adjacency.clone()
@@ -130,42 +154,25 @@ class PhysicsInformedSpatialInverter(PyroModule):
         for _ in range(self.diffusion_steps):
             # Apply diffusion: x_new = x - D * L * x
             diffusion_update = torch.matmul(combined_laplacian, expression)
-            # Constrain the update magnitude to prevent instability
-            update_scale = torch.norm(diffusion_update, dim=1, keepdim=True)
-            expression_scale = torch.norm(expression, dim=1, keepdim=True) + 1e-8
-            scale_factor = torch.clamp(update_scale / expression_scale, max=0.5)
-            normalized_update = diffusion_update * (0.5 / (scale_factor + 1e-8))
-            
-            expression = expression - spot_diffusion_rates.unsqueeze(1) * normalized_update
-            # expression = expression - spot_diffusion_rates.unsqueeze(1) * diffusion_update
+            expression = expression - spot_diffusion_rates.unsqueeze(1) * diffusion_update
             expression = torch.clamp(expression, min=0.0)
         
-        current_total = expression.sum(dim=0, keepdim=True)
-        # Normalize to match total counts
-        expression = expression * (self.total_counts / (current_total + 1e-10))
         return expression
     
-    def robust_log_transform(self, x, clip_quantile=0.97):
+    def robust_log_transform(self, x, clip_quantile=0.99):
         # Clip extreme values
         upper = torch.quantile(x, clip_quantile)
         x_clipped = torch.clamp(x, max=upper, min=1e-06)
         x_clipped = torch.log(x_clipped)
         # Log transform
         return x_clipped
-
+    
     @pyro_method
     def model(self):
-        """
-        Pyro probabilistic model
-        
-        Args:
-            self.Y: [n_spots, n_genes]
-            total_counts: [n_spots]
-        """
-        with pyro.plate("spots", self.n_spots):
+        with pyro.plate("spot_diffrate", self.n_spots):
                 spot_diffusion_rates = pyro.sample(
                     "spot_diffusion_rates",
-                    dist.Beta(1.5, 10.0)
+                    dist.Beta(1.1, 8.0)
                 )
         
         # Sample true undiffused expression
@@ -174,7 +181,7 @@ class PhysicsInformedSpatialInverter(PyroModule):
                 true_expression = pyro.sample(
                     "true_expression",
                     dist.LogNormal(
-                        self.robust_log_transform(self.Y),
+                        self.robust_log_transform(self.X),
                         torch.ones_like(self.Y) * 0.1  # Small scale for stability
                     )
                 )
@@ -196,12 +203,30 @@ class PhysicsInformedSpatialInverter(PyroModule):
         # Forward diffusion process
         diffused_expression = self.forward_diffusion(true_expression, spot_diffusion_rates)
         
-        # Observation model
+        # # Observation model
+        # with pyro.plate("obs_spots", self.n_spots, dim=-2):
+        #     with pyro.plate("obs_genes", self.n_genes, dim=-1):
+        #         pyro.sample(
+        #             "obs",
+        #             dist.Poisson(diffused_expression),
+        #             obs=self.Y
+        #         )
+        
+    
+        # Overdispersion parameter for Negative Binomial
+        concentration = pyro.param("concentration", torch.ones_like(self.Y) * 10.0,  # Start with moderate overdispersion
+                            constraint=dist.constraints.positive)
+        
+        # Observation model with Negative Binomial
         with pyro.plate("obs_spots", self.n_spots, dim=-2):
             with pyro.plate("obs_genes", self.n_genes, dim=-1):
+                logits = torch.log(concentration + 1e-8) - torch.log(diffused_expression + 1e-8)
                 pyro.sample(
                     "obs",
-                    dist.Poisson(diffused_expression),
+                    dist.NegativeBinomial(
+                        total_count=concentration,  # Dispersion parameter
+                        logits=logits  # Log-odds of success
+                    ),
                     obs=self.Y
                 )
         
@@ -211,49 +236,76 @@ class PhysicsInformedSpatialInverter(PyroModule):
         return true_expression
     
     def _add_physics_penalties(self, true_expression):
-        """Add physics-based penalty terms"""
+        """Add physics-based penalty terms with balanced weights"""
+        scale_factor = self.scale_factor
         
-        # # 1. Mass conservation penalty
-        # true_total = true_expression.sum(dim=1)
-        # obs_total = self.Y.sum(dim=1)
-        # mass_conservation_loss = torch.sum((true_total - obs_total) ** 2) / torch.sum(obs_total ** 2)  # Normalize by total observed expression
-        # pyro.factor("mass_conservation", - 1.0 * mass_conservation_loss)
+        # # 1. Mass conservation penalty (keep current weight)
+        # true_total = true_expression.sum(dim=0)
+        # obs_total = self.Y.sum(dim=0)
+        # mass_conservation_loss = torch.sum((true_total - obs_total) ** 2) / torch.sum(obs_total ** 2)
+        # mass_conservation_loss = - mass_conservation_loss * scale_factor
+        # # print(f"Mass conservation loss: {mass_conservation_loss.item()}")
+        # pyro.factor("mass_conservation", mass_conservation_loss)  # Increased from 1.0
         
-        # 2. Spatial smoothness penalty using combined Laplacian
+        # 2. Spatial smoothness penalty (reduce weight)
         if self.adaptive_laplacian is not None:
             combined_laplacian = 0.9 * self.spatial_laplacian + 0.1 * self.adaptive_laplacian
         else:
             combined_laplacian = self.spatial_laplacian
         observed_smoothness = torch.trace(self.Y.T @ combined_laplacian @ self.Y)
         smoothness_penalty = torch.trace(true_expression.T @ combined_laplacian @ true_expression)
-        smoothness_penalty = smoothness_penalty / (observed_smoothness + 1e-8)  # Avoid division by zero
-        pyro.factor("spatial_smoothness", - 1.0 * smoothness_penalty)
+        smoothness_penalty = smoothness_penalty / (observed_smoothness + 1e-8)
+        smoothness_penalty = - 0.1 * smoothness_penalty * scale_factor  # Reduced from 1.0
+        # print(f"Spatial smoothness penalty: {smoothness_penalty.item()}")
+        pyro.factor("spatial_smoothness", smoothness_penalty)  # Reduced from 1.0
         
-        # 3. Non-cell penalty - penalize expression in non-cell containing spots
+        # 3. Non-cell penalty (increase base penalty calculation)
         if self.cell_count is not None:
-            non_cell_expression_dist = self.cell_count.float() / (self.cell_count.sum() + 1e-8)  # Normalize by total cell count
-            non_cell_expression_dist = non_cell_expression_dist.unsqueeze(1)
+            cell_count_dist = self.cell_count.float() / (self.cell_count.sum() + 1e-8)
             norm_true_expression = true_expression.sum(dim=1)
-            norm_true_expression = norm_true_expression / (norm_true_expression.sum())
-            # Compute non-cell penalty as KL divergence
-            cell_count_penalty = torch.mean(
-                torch.abs(norm_true_expression - non_cell_expression_dist)
-            )
-            pyro.factor("non_cell_penalty", - 1.0 * cell_count_penalty)
+            norm_true_expression = norm_true_expression / (norm_true_expression.sum() + 1e-8)
             
-        # 4. Cluster separation loss
+            # Add small epsilon for numerical stability
+            eps = 1e-8
+            target_dist = cell_count_dist.squeeze() + eps
+            pred_dist = norm_true_expression + eps
+            
+            # KL divergence: naturally scaled and meaningful
+            kl_div = torch.sum(target_dist * torch.log(target_dist / pred_dist))
+            cell_count_kl = - 2.0 * kl_div * scale_factor
+            # Apply KL divergence (already well-scaled)
+            pyro.factor("cell_count_kl", cell_count_kl)
+                        
+        # 4. Cluster separation loss (keep current)
         if self.cluster_labels is not None:
             cluster_separation_loss = self._cluster_separation_loss(true_expression, self.cluster_labels)
-            pyro.factor("cluster_separation", - 1.0 * cluster_separation_loss)
+            cluster_separation_loss = - 0.2 * cluster_separation_loss * scale_factor
+            pyro.factor("cluster_separation", cluster_separation_loss)
             
-        # Add entropy regularization to avoid concentration in few spots
-        norm_expr = true_expression / (true_expression.sum(dim=0, keepdim=True) + 1e-8)
-        entropy = -torch.mean(torch.sum(norm_expr * torch.log(norm_expr + 1e-8), dim=0))
-        pyro.factor("entropy_regularization", 0.5 * entropy)  # Maximize entropy (distribute expression)
-
+        # 6. Diffusion rate smoothness
+        alpha = pyro.get_param_store()["alpha_param"]
+        beta = pyro.get_param_store()["beta_param"]
+        mean_diffrates = alpha / (alpha + beta)
+        threshold = 0.15
+        above_threshold = torch.relu(mean_diffrates - threshold)
+        threshold_penalty = torch.sum(above_threshold ** 2) / torch.sum(mean_diffrates ** 2)
+        threshold_penalty = - threshold_penalty * scale_factor
+        # print(f"Diffusion rate threshold penalty: {threshold_penalty.item()}")
+        pyro.factor("diffusion_rate_threshold", threshold_penalty)
+        
+        if torch.rand(1) < 0.01:  # Print occasionally
+            print(
+                # f"Penalties: mass={mass_conservation_loss.item():.3f}, ",
+                f"spatial_smoothness={smoothness_penalty.item():.3f}, ",
+                f'cell_count={cell_count_kl.item():.3f}, ',
+                f"cluster={cluster_separation_loss.item()}, ",
+                f"diffrate_threshold={threshold_penalty.item():.3f}",
+                # f"entropy={entropy.item():.3f}"
+                )
+            
     def _cluster_separation_loss(self, true_expr: torch.Tensor, cluster_labels: torch.Tensor) -> torch.Tensor:
         """Maximize between-cluster distance, minimize within-cluster distance"""
-        unique_clusters = np.unique(cluster_labels)
+        unique_clusters = np.unique(cluster_labels)  # Use torch.unique instead of np.unique
         n_clusters = len(unique_clusters)
         
         if n_clusters < 2:
@@ -262,10 +314,12 @@ class PhysicsInformedSpatialInverter(PyroModule):
         # Compute cluster centroids
         centroids = []
         for cluster_id in unique_clusters:
-            mask = cluster_labels == cluster_id
-            centroid = true_expr[:, mask].mean(dim=1)
+            mask = cluster_labels == cluster_id  # [n_spots] boolean mask
+            # FIX: Apply mask to correct dimension (spots, not genes)
+            cluster_expr = true_expr[mask, :]  # [n_spots_in_cluster, n_genes]
+            centroid = cluster_expr.mean(dim=0)   # [n_genes] - average across spots in cluster
             centroids.append(centroid)
-        centroids = torch.stack(centroids)
+        centroids = torch.stack(centroids)  # [n_clusters, n_genes]
         
         # Between-cluster distance (maximize)
         between_dist = torch.pdist(centroids, p=2).mean()
@@ -274,10 +328,10 @@ class PhysicsInformedSpatialInverter(PyroModule):
         within_dist = 0.0
         for i, cluster_id in enumerate(unique_clusters):
             mask = cluster_labels == cluster_id
-            cluster_expr = true_expr[:, mask]
-            if cluster_expr.shape[1] > 1:
-                centroid = centroids[i].unsqueeze(1)
-                within_dist += torch.norm(cluster_expr - centroid, p=2, dim=0).mean()
+            cluster_expr = true_expr[mask, :]  # FIX: Correct indexing
+            if cluster_expr.shape[0] > 1:  # FIX: Check number of spots, not genes
+                centroid = centroids[i].unsqueeze(0)  # [1, n_genes]
+                within_dist += torch.norm(cluster_expr - centroid, p=2, dim=1).mean()  # FIX: dim=1 for genes
         
         # Minimize within/between ratio
         return within_dist / (between_dist + 1e-6)
@@ -287,18 +341,20 @@ class PhysicsInformedSpatialInverter(PyroModule):
         """Variational guide"""
         
         # Variational parameters for diffusion rates
-        if self.diffusion_encoder is not None:
-            # Encode tissue features to diffusion parameters
-            diffusion_params = self.diffusion_encoder(self.img_features)
-            alpha_param = F.softplus(diffusion_params[:, 0]) + 1.0
-            beta_param = F.softplus(diffusion_params[:, 1]) + 1.0
-        else:
-            alpha_param = pyro.param("alpha_param", torch.ones(self.n_spots) * 2.0, 
-                                constraint=dist.constraints.positive)
-            beta_param = pyro.param("beta_param", torch.ones(self.n_spots) * 8.0,
-                                constraint=dist.constraints.positive)
+        # if self.diffusion_encoder is not None:
+        #     # Encode tissue features to diffusion parameters
+        #     diffusion_params = self.diffusion_encoder(self.img_features)
+        #     alpha_param = F.softplus(diffusion_params[:, 0]) 
+        #     alpha_param = pyro.param("alpha_param", alpha_param, constraint=dist.constraints.positive)
+        #     beta_param = F.softplus(diffusion_params[:, 1]) + 2.0
+        #     beta_param = pyro.param("beta_param", beta_param, constraint=dist.constraints.positive)
+        # else:
+        alpha_param = pyro.param("alpha_param", torch.ones(self.n_spots) * 1.2, 
+                            constraint=dist.constraints.positive)
+        beta_param = pyro.param("beta_param", torch.ones(self.n_spots) * 10.0,
+                            constraint=dist.constraints.positive)
         
-        with pyro.plate("spots", self.n_spots):
+        with pyro.plate("spot_diffrate", self.n_spots):
             spot_diffusion_rates = pyro.sample(
                 "spot_diffusion_rates",
                 dist.Beta(alpha_param, beta_param)
